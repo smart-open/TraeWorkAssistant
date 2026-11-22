@@ -37,7 +37,22 @@ on:
   push:
     branches:
       - macos_main
+      - main
+      - master
+  # PR 到主干时也跑构建（不部署不发布，仅验证 mac 产物可编译——多分支并行
+  # 开发期间 push 仅覆盖 macos_main，合入前的 mac 回归完全无覆盖，审查 P3-17）
+  pull_request:
+    branches:
+      - main
+      - master
   workflow_dispatch:
+
+# P3-17 审查补充：push 到 macos_main 与「macos_main → main 的 open PR」会同时命中
+# push + pull_request 触发，3 矩阵 macOS 构建双份并发白烧 runner——同 PR/同分支
+# 的新推送取消旧构建（仅构建验证用途，可安全取消；push 按分支 ref 分组）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

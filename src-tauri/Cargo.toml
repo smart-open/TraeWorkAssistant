@@ -1,6 +1,6 @@
 [package]
 name = "ai-work-assistant"
-version = "3.9.3"
+version = "3.9.5"
 description = "AI Work 助手 - 多账号签到与管理桌面端"
 edition = "2021"
 rust-version = "1.85"
@@ -62,12 +62,22 @@ hyper = { version = "1", features = ["client", "server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["client-legacy", "server", "server-auto", "http1", "tokio", "service"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "logging", "tls12", "webpki-tokio"] }
-tokio-rustls = { version = "0.26", features = ["logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# issue #224：TLS 加密后端显式收敛到 ring。rustls 0.23 默认 provider 是 aws-lc-rs
+# （C 代码），其内部错误/断言直接 abort → 0xc0000409/0x7（FAST_FAIL_FATAL_APP_EXIT）
+# 无声崩溃且 catch_unwind 拦不住；ring 为纯 Rust，异常路径可观测可 unwind。
+# 显式声明仅为保证 rustls 的 "ring" feature 编译进进程（进程默认 provider 由
+# main.rs install_default 切换）；rcgen 的 KeyPair 仍需 aws_lc_rs（见上方注释），不动。
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "ring"] }
 hyper-tungstenite = "0.19"
 # aws_lc_rs：KeyPair 解析需支持 PKCS#1（老版 Python CA 私钥 "BEGIN RSA PRIVATE KEY"），
 # ring 后端只认 PKCS#8，会导致启动代理报「解析 CA 私钥失败: Could not parse key pair」
 rcgen = { version = "0.14", features = ["x509-parser", "aws_lc_rs"] }
+# issue #224：TLS 收敛 ring 后 rustls/aws_lc_rs 的 prebuilt-nasm 特性链断开，此处
+# 补回——aws-lc-sys 用 crate 内置预编译 NASM 物件构建，无 NASM 的环境（本机/CI）
+# 也能编译；仅影响构建方式，不影响运行时（aws-lc-rs 仍只被 rcgen CA 签发使用）
+aws-lc-rs = { version = "1", default-features = false, features = ["prebuilt-nasm"] }
 time = "0.3"
 futures-util = "0.3"
 regex = "1"

@@ -265,8 +265,8 @@ export default function DoubaoQuotaDashboard() {
             hint={
               uidSel
                 ? `已按 ${uidSel.size} 个账号筛选（聚合口径未筛选时以池统计为准）`
-                : stats.today_ok + stats.today_already + stats.today_failed > 0
-                  ? `签到成功 ${stats.today_ok + stats.today_already} · 失败 ${stats.today_failed}`
+                : stats.today_ok + stats.today_already + stats.today_failed + stats.today_skip > 0
+                  ? `签到成功 ${stats.today_ok + stats.today_already} · 失败 ${stats.today_failed}${stats.today_skip > 0 ? ` · 跳过 ${stats.today_skip}` : ''}`
                   : '今日尚未签到'
             }
             tone="green"

@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useState } from 'react';
-import { RefreshCw, CheckCircle2, Circle, ChevronRight, CalendarCheck, Trophy, TriangleAlert } from 'lucide-react';
+import { RefreshCw, CheckCircle2, Circle, ChevronRight, TriangleAlert } from 'lucide-react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Tooltip,
+  CartesianGrid,
+  Cell,
+  LabelList,
+  Legend,
+} from 'recharts';
 import PageHeader from '../../components/PageHeader';
 import { StatCard, Badge } from '../../components/ui';
 import CertManualGuide, { caCerExists } from '../../components/CertManualGuide';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
+import { useIsDark } from '../../lib/useIsDark';
 import type { AppLocate, DoubaoAccountView, DoubaoCheckinTrendPoint, DoubaoDashboardStats } from '../../types';
 
 /** 豆包配置导航步骤定义（完成判定全部来自实时状态） */
@@ -159,148 +172,156 @@ function DoubaoSetupGuide({ installed, accounts }: { installed: boolean; account
 
 /**
  * 近 30 天签到结果卡：按日落库保证同账号同日仅一条记录（重试轮覆盖为最终态），
- * 展示成功（含已签，已签视为成功）/ 失败计数 + 按日双色柱状图
+ * 展示成功（含已签，已签视为成功）/ 失败计数 + Recharts 三色堆叠柱状图（对齐 Buddy 概述样式）
  */
 function CheckinResultsCard({ trend }: { trend: DoubaoCheckinTrendPoint[] }) {
   const sums = useMemo(
     () =>
+      // P3-15 审查修复：徽标并入 skip（确定性跳过）——trend 点已带 skip 字段，
+      // 此前徽标只计 ok/failed，与下方堆叠柱状图三色口径不一致
       trend.reduce(
-        (acc, d) => ({ ok: acc.ok + d.ok + d.already, failed: acc.failed + d.failed }),
-        { ok: 0, failed: 0 },
+        (acc, d) => ({
+          ok: acc.ok + d.ok + d.already,
+          skip: acc.skip + (d.skip ?? 0),
+          failed: acc.failed + d.failed,
+        }),
+        { ok: 0, skip: 0, failed: 0 },
       ),
     [trend],
   );
-
-  const W = 300;
-  const H = 48;
-  const slot = trend.length > 0 ? W / trend.length : W;
-  const barW = Math.max(2, Math.min(10, slot - 2));
-  const maxTotal = Math.max(1, ...trend.map((d) => d.ok + d.already + d.failed));
+  const isDark = useIsDark();
 
   return (
-    <div className="card p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <CalendarCheck size={16} className="text-emerald-500" />
-          <span className="text-sm font-medium">近 30 天签到结果</span>
-        </div>
+    <div className="card p-5">
+      <div className="mb-4 flex items-center justify-between">
+        <h3 className="font-medium">近 30 天签到结果</h3>
         <div className="flex items-center gap-1.5 text-xs">
           <Badge tone={sums.ok > 0 ? 'green' : 'slate'}>成功 {sums.ok}</Badge>
+          {sums.skip > 0 && <Badge tone="slate">跳过 {sums.skip}</Badge>}
           <Badge tone={sums.failed > 0 ? 'red' : 'slate'}>失败 {sums.failed}</Badge>
         </div>
       </div>
       {trend.length === 0 ? (
-        <p className="py-6 text-center text-xs text-slate-400">
+        <div className="flex h-40 items-center justify-center text-sm text-slate-400">
           数据积累中：注册「每日签到」或到「一键签到」手动签到后，这里会展示近 30 天每日签到结果。
-        </p>
+        </div>
       ) : (
-        <>
-          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="近 30 天签到结果图">
-            <line x1="0" y1={H - 1} x2={W} y2={H - 1} className="stroke-slate-200 dark:stroke-zinc-700" strokeWidth="1" />
-            {trend.map((d, i) => {
-              const x = i * slot + (slot - barW) / 2;
-              const scale = (H - 6) / maxTotal;
-              const okH = (d.ok + d.already) * scale;
-              const faH = d.failed * scale;
-              return (
-                <g key={d.date}>
-                  {okH > 0 && <rect x={x} y={H - 1 - okH} width={barW} height={okH} rx="1" className="fill-emerald-500" />}
-                  {faH > 0 && <rect x={x} y={H - 1 - okH - faH} width={barW} height={faH} rx="1" className="fill-rose-500" />}
-                  {okH + faH <= 0 && <rect x={x} y={H - 4} width={barW} height={3} rx="1" className="fill-slate-100 dark:fill-zinc-800" />}
-                  {/* 悬停提示：透明命中区覆盖整列（细柱不必瞄准），原生 title 展示当日成功/失败 */}
-                  <rect x={i * slot} y={0} width={slot} height={H} fill="transparent" className="cursor-help">
-                    <title>{`${d.date.slice(5)} · 成功 ${d.ok + d.already} · 失败 ${d.failed}`}</title>
-                  </rect>
-                </g>
-              );
-            })}
-          </svg>
-          <div className="mt-1 flex items-center justify-between text-[11px] text-slate-400">
-            <span>{trend[0]?.date ?? ''}</span>
-            <span className="flex items-center gap-2">
-              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-emerald-500" />成功（含已签）</span>
-              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-rose-500" />失败</span>
-            </span>
-            <span>{trend[trend.length - 1]?.date ?? ''}</span>
-          </div>
-        </>
+        <div className="h-64">
+          <ResponsiveContainer>
+            <BarChart data={trend} margin={{ top: 8, right: 16, left: 0, bottom: 4 }} barCategoryGap="24%">
+              <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+              <XAxis
+                dataKey="date"
+                tickFormatter={(v: string) => v.slice(5)}
+                tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                tickLine={false}
+              />
+              <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={36} />
+              <Tooltip
+                cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                contentStyle={{
+                  fontSize: 12,
+                  borderRadius: 10,
+                  border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                  background: isDark ? '#18181b' : '#fff',
+                  color: isDark ? '#e4e4e7' : '#1e293b',
+                  boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                  padding: '8px 12px',
+                }}
+              />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar dataKey="ok" name="成功" stackId="trend" fill="#10b981" maxBarSize={28} />
+              <Bar dataKey="already" name="已签" stackId="trend" fill="#0ea5e9" maxBarSize={28} />
+              <Bar dataKey="skip" name="跳过" stackId="trend" fill="#94a3b8" maxBarSize={28} />
+              <Bar dataKey="failed" name="失败" stackId="trend" fill="#f43f5e" maxBarSize={28} radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
       )}
     </div>
   );
 }
 
-/** 额度 TOP 榜：竖向柱状图（对齐「近 30 天签到结果」图式），从高到低 Top 8（quota_total 未知不参与） */
+/** 额度 TOP 榜：Recharts 柱状图（对齐 Buddy 积分榜样式），从高到低 Top 8（quota_total 未知不参与） */
 function QuotaTopCard({ accounts }: { accounts: DoubaoAccountView[] }) {
   const top = useMemo(
     () =>
       accounts
         .filter((a) => a.quota_total != null)
         .sort((a, b) => (b.quota_total ?? 0) - (a.quota_total ?? 0))
-        .slice(0, 8),
+        .slice(0, 8)
+        .map((a) => ({ name: a.name || a.user_id, quota: a.quota_total ?? 0 })),
     [accounts],
   );
-  const W = 300;
-  const H = 48;
-  const slot = top.length > 0 ? W / top.length : W;
-  const barW = Math.max(2, Math.min(10, slot - 2));
-  const max = top.length > 0 ? Math.max(1, ...top.map((a) => a.quota_total ?? 0)) : 1;
-  // 柱顶数值紧凑格式：≥1万用「x.x万」，避免窄槽位溢出
+  const isDark = useIsDark();
+  // 柱顶数值紧凑格式：≥1万用「x.x万」，避免轴标签溢出
   const compact = (v: number) => (v >= 10000 ? `${(v / 10000).toFixed(1)}万` : v.toLocaleString());
 
   return (
-    <div className="card p-4">
-      <div className="mb-2 flex items-center gap-2">
-        <Trophy size={16} className="text-amber-500" />
-        <span className="text-sm font-medium">额度 TOP 榜</span>
-        <span className="text-xs text-slate-400">从高到低 · Top {top.length || 0}</span>
+    <div className="card p-5">
+      <div className="mb-4 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <h3 className="font-medium">额度 TOP 榜</h3>
+          {top.length > 0 && (
+            <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+              Top {top.length}
+            </span>
+          )}
+        </div>
+        <span className="text-xs text-slate-400">按总额度排序</span>
       </div>
       {top.length === 0 ? (
-        <p className="py-6 text-center text-xs text-slate-400">
+        <div className="flex h-40 items-center justify-center text-sm text-slate-400">
           数据积累中：完成签到或查询额度后，账号总额度会自动回写并参与排行。
-        </p>
+        </div>
       ) : (
-        <>
-          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="额度 TOP 榜柱状图">
-            <line x1="0" y1={H - 1} x2={W} y2={H - 1} className="stroke-slate-200 dark:stroke-zinc-700" strokeWidth="1" />
-            {top.map((a, i) => {
-              const v = a.quota_total ?? 0;
-              const h = Math.max(4, (v / max) * (H - 20));
-              const x = i * slot + (slot - barW) / 2;
-              return (
-                <g key={a.user_id}>
-                  <text
-                    x={x + barW / 2}
-                    y={H - 1 - h - 4}
-                    textAnchor="middle"
-                    fontSize="8"
-                    className="fill-slate-500 font-mono dark:fill-zinc-400"
-                  >
-                    {compact(v)}
-                  </text>
-                  <rect
-                    x={x}
-                    y={H - 1 - h}
-                    width={barW}
-                    height={h}
-                    rx="1"
-                    className={i === 0 ? 'fill-amber-500' : 'fill-amber-400/70'}
-                  />
-                </g>
-              );
-            })}
-          </svg>
-          <div className="mt-1 flex items-start justify-between">
-            {top.map((a) => (
-              <span
-                key={a.user_id}
-                className="min-w-0 flex-1 truncate px-0.5 text-center text-[10px] text-slate-500 dark:text-zinc-400"
-                title={`${a.name} · ${(a.quota_total ?? 0).toLocaleString()}`}
-              >
-                {a.name}
-              </span>
-            ))}
-          </div>
-        </>
+        <div className="h-72">
+          <ResponsiveContainer>
+            <BarChart data={top} margin={{ top: 24, right: 16, left: 0, bottom: 4 }} barCategoryGap="36%">
+              <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#3f3f46' : '#e2e8f0'} opacity={0.25} vertical={false} />
+              <XAxis
+                dataKey="name"
+                tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }}
+                interval={0}
+                angle={-20}
+                textAnchor="end"
+                height={52}
+                axisLine={{ stroke: isDark ? '#3f3f46' : '#e2e8f0' }}
+                tickLine={false}
+              />
+              <YAxis tick={{ fontSize: 11, fill: isDark ? '#a1a1aa' : '#94a3b8' }} axisLine={false} tickLine={false} width={48} />
+              <Tooltip
+                cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
+                contentStyle={{
+                  fontSize: 12,
+                  borderRadius: 10,
+                  border: `1px solid ${isDark ? '#3f3f46' : '#e2e8f0'}`,
+                  background: isDark ? '#18181b' : '#fff',
+                  color: isDark ? '#e4e4e7' : '#1e293b',
+                  boxShadow: '0 6px 16px rgba(0,0,0,0.1)',
+                  padding: '8px 12px',
+                }}
+                formatter={(v: number) => [v.toLocaleString(), '总额度']}
+              />
+              <Bar dataKey="quota" radius={[8, 8, 0, 0]} maxBarSize={44}>
+                {top.map((_, i) => {
+                  const colors = isDark ? ['#fafafa', '#e4e4e7', '#d4d4d8'] : ['#27272a', '#3f3f46', '#52525b'];
+                  const fill = i < 3 ? colors[i] : isDark
+                    ? `rgba(212,212,216,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`
+                    : `rgba(82,82,91,${Math.max(0.35, 0.6 - (i - 3) * 0.05).toFixed(2)})`;
+                  return <Cell key={i} fill={fill} />;
+                })}
+                <LabelList
+                  dataKey="quota"
+                  position="top"
+                  formatter={compact}
+                  style={{ fontSize: 10, fill: isDark ? '#a1a1aa' : '#94a3b8', fontWeight: 500 }}
+                />
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
       )}
     </div>
   );

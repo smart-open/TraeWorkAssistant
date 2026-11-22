@@ -390,7 +390,7 @@ function TaskConfigCard({
           <input
             type="checkbox"
             className="mt-0.5"
-            checked={settings?.auto_checkin ?? false}
+            checked={settings?.auto_checkin ?? true}
             onChange={(e) => patch({ auto_checkin: e.target.checked })}
           />
           <span className="text-sm">

@@ -48,13 +48,23 @@ pub(super) fn load_buddy_pool(state: &AppState) -> WbPool {
 }
 
 /// buddy-ai 池账号花名册（跨模块 tasks/buddy_ai_checkin 消费；WbPool 字段
-/// pub(super) 不对 tasks 暴露，经此 helper 交出 (id, 展示名, uid) 三元组）
-pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String)> {
+/// pub(super) 不对 tasks 暴露，经此 helper 交出 (id, 展示名, uid, proxy_url) 四元组
+/// ——P3-11 审查修复：proxy_url 一并交出，打卡轮按账号构建独立出口代理 agent，
+/// 口径对齐 wb_checkin（同池账号数据源，wb 侧已消费 proxy_url 而 buddy-ai 打卡
+/// 漏接，同账号两任务出口不一致本身就是画像信号））
+pub(crate) fn buddy_pool_roster(state: &AppState) -> Vec<(String, String, String, Option<String>)> {
     load_buddy_pool(state)
         .accounts
         .iter()
         .filter(|a| !a.disabled) // P3 启停：停用账号不参与打卡花名册
-        .map(|a| (a.id.clone(), if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() }, a.uid.clone()))
+        .map(|a| {
+            (
+                a.id.clone(),
+                if a.nickname.is_empty() { a.id.clone() } else { a.nickname.clone() },
+                a.uid.clone(),
+                a.proxy_url.clone().filter(|s| !s.trim().is_empty()),
+            )
+        })
         .collect()
 }
 
@@ -1131,6 +1141,88 @@ pub(crate) fn buddy_ai_checkin_enabled(state: &AppState) -> bool {
 /// buddy-ai 池账号数（调度器 models 类任务空池静默跳过判定用）
 pub(crate) fn buddy_ai_pool_size(state: &AppState) -> usize {
     load_buddy_pool(state).accounts.len()
+}
+
+// ── OAuth 重登打卡补跑（issue #220 P2，对齐国内 wb 补签形态）────────────────
+
+/// 当日该账号打卡状态（buddy_ai_checkin_results 当日 success 行；None = 无记录。
+/// already 为非最终态不落行——已签判定以 last_daily_chat 本地幂等戳为准，此处
+/// 仅用于拦截明确已成功的重登账号，避免无谓整轮补跑）
+fn buddy_ai_today_checkin_status(state: &AppState, aid: &str) -> Option<String> {
+    let root: Value =
+        crate::store::docs::buddy_ai_checkin_results_load(&crate::store::db(&state.data_dir));
+    let today = crate::tasks::buddy_ai_checkin::today_stamp();
+    root.get("results")?
+        .as_array()?
+        .iter()
+        .filter(|r| {
+            r.get("user_id").and_then(Value::as_str) == Some(aid)
+                && r.get("date").and_then(Value::as_str) == Some(today.as_str())
+        })
+        .last()
+        .and_then(|r| r.get("status").and_then(Value::as_str).map(str::to_string))
+}
+
+/// OAuth 重登后打卡补跑：打卡开关开启且当日结果无 success 行时，后台整轮补跑
+///（轮次锁幂等互斥，撞锁静默放弃）。已完成账号靠 last_daily_chat 本地幂等戳
+/// 早返回（本地读秒级空过），重登账号走完整六步链。供 oauth.rs BuddyAi sink 调用
+pub(crate) fn spawn_oauth_checkin_catchup_buddy_ai(app: &AppHandle, state: &AppState, target_id: &str) {
+    if !buddy_ai_checkin_enabled(state) {
+        return;
+    }
+    if buddy_ai_today_checkin_status(state, target_id).as_deref() == Some("success") {
+        return;
+    }
+    let app = app.clone();
+    let st = state.clone();
+    let spawned = std::thread::Builder::new()
+        .name("buddy-ai-oauth-catchup".into())
+        .spawn(move || {
+            let Ok(_guard) = try_acquire_buddy_ai_round() else {
+                return; // 抢不到轮次锁（UI/调度轮次在跑）= 幂等跳过
+            };
+            let mut events: Vec<Value> = Vec::new();
+            // 网关运行态句柄：打卡到账运行期拨进 buddy_ai_pool（对齐启动补跑）
+            let rt = app
+                .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+            let done = crate::tasks::buddy_ai_checkin::run_checkin_round(
+                &st,
+                Some(rt.inner()),
+                &mut |ev| events.push(ev.clone()),
+            );
+            fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "buddy-ai: OAuth 重登后打卡补跑——ok={} already={} failed={}",
+                    done.get("ok").and_then(Value::as_i64).unwrap_or(0),
+                    done.get("already").and_then(Value::as_i64).unwrap_or(0),
+                    done.get("failed").and_then(Value::as_i64).unwrap_or(0),
+                ),
+            );
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            if failed > 0 {
+                let names: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                    .map(|e| {
+                        e.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect();
+                crate::commands::workbuddy::push_notify(
+                    Some(&app),
+                    &st.data_dir,
+                    "Buddy 国际版打卡",
+                    &format!("{} 个账号打卡失败：{}", failed, names.join("、")),
+                    crate::notify::NotifyEvent::TaskFail,
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        fs_utils::app_log(&state.data_dir, &format!("buddy-ai: OAuth 补跑线程创建失败: {e}"));
+    }
 }
 
 /// 启动打卡补跑（对齐 startup_auto_checkin 形态）：60s 延迟 → 抢轮次锁 →

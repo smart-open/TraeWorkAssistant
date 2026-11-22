@@ -534,6 +534,16 @@ pub(super) fn oauth_flow(
     // 网关可能以半新池状态参与调度且双份 reload 日志刷屏。保留上方块（含锁序
     // 论证），此处仅留说明；兜底由一致性巡检线程 60s 内捕获。
 
+    // issue #220 P2：扫码重登自动补签——重登多因 token 失效/上游限制，当日签到
+    // 大概率失败或未跑；开关开启且当日未成功时后台补跑（轮次锁幂等互斥，撞锁/
+    // 关闭/已成功均静默跳过）。CN=单号补签；Intl=整轮打卡（已完成账号靠
+    // last_daily_chat 本地幂等早返回，秒级空过）
+    if matches!(sink, PoolSink::BuddyAi) {
+        super::buddy_ai::spawn_oauth_checkin_catchup_buddy_ai(app, state, &target_id);
+    } else {
+        super::checkin::spawn_oauth_checkin_catchup(app, state, &target_id, &label);
+    }
+
     emit("success", &format!("账号「{label}」已扫码登录并自动入池"), None);
     Ok((target_id, label))
 }

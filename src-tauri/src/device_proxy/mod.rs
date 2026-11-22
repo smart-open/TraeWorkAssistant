@@ -13,13 +13,14 @@ pub mod upstream;
 pub mod ws;
 pub mod bypass;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http_body_util::{Full, Limited};
 use hyper::body::Bytes;
@@ -57,6 +58,77 @@ const MAX_CONNS: usize = 512;
 const OVERLOAD_LOG_INTERVAL_SECS: u64 = 5;
 /// CONNECT 200 应答后的 TLS 握手超时（客户端不发 ClientHello 时及时释放连接与并发槽）
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// raw-tunnel 失败熔断阈值（issue #209）：同一目标连续直连失败 N 次后进入冷却
+const TUNNEL_FAIL_THRESHOLD: u32 = 3;
+/// raw-tunnel 熔断冷却期：期内不再重复直连探测（每次直连超时挂 20s+），直接回 502
+/// 快速失败——阻断客户端（Chrome 同步 clients4.google.com 等）对不可达域的无限重试
+/// 流量风暴（issue #209 火绒实测持续 4.9 MB/s）
+const TUNNEL_COOLDOWN: Duration = Duration::from_secs(60);
+/// raw-tunnel 失败日志节流：同一目标每分钟至多记录一条，避免 proxy.log 刷屏
+const TUNNEL_LOG_THROTTLE: Duration = Duration::from_secs(60);
+/// 审查修复（2026-11-18 #4）：闲置条目淘汰阈值——条目既不在冷却生效中、又超过该
+/// 时长无活动（失败 1-2 次未达阈值后不再访问的主机），从表中移除，防代理长期
+/// 运行下 TUNNEL_BREAKER 无界增长。e.2 仅在记日志时刷新（节流 60s），未达阈值
+/// 条目的 e.2 ≈ 首次/最近失败时刻，作为「最近活跃」近似足够
+const TUNNEL_IDLE_EVICT: Duration = Duration::from_secs(600);
+
+/// key: "host:port" → (连续失败计数, 冷却起点, 最近一次记日志时刻)
+static TUNNEL_BREAKER: LazyLock<Mutex<HashMap<String, (u32, Instant, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 熔断是否生效中：连续失败达阈值且仍在冷却期内。生效时调用方直接回 502，
+/// 不再尝试直连/上游建连。每次判定前顺带清扫闲置条目（审查修复 #4）——
+/// 每条 CONNECT 仅一次 retain 遍历，表规模小（活跃失败目标屈指可数），开销可忽略
+fn tunnel_breaker_open(host: &str, port: u16) -> bool {
+    let now = Instant::now();
+    let mut m = TUNNEL_BREAKER.lock().unwrap_or_else(|e| e.into_inner());
+    // 冷却生效中的条目保留（快速失败判定仍需读取）；其余条目超闲置阈值即淘汰。
+    // 副作用：闲置 >10 分钟后失败计数清零重新累积——对 #209 防的是秒级重试风暴，
+    // 慢速失败序列本就不构成风暴，语义无损
+    m.retain(|_, (f, opened, logged)| {
+        (*f >= TUNNEL_FAIL_THRESHOLD && opened.elapsed() < TUNNEL_COOLDOWN)
+            || now.duration_since(*logged) < TUNNEL_IDLE_EVICT
+    });
+    let key = format!("{host}:{port}");
+    m.get(&key)
+        .is_some_and(|(f, opened, _)| *f >= TUNNEL_FAIL_THRESHOLD && opened.elapsed() < TUNNEL_COOLDOWN)
+}
+
+/// 记录一次直连建连失败；返回是否应记日志（首次达阈值必记一条，之后每分钟一条）。
+fn tunnel_breaker_fail(host: &str, port: u16) -> bool {
+    let key = format!("{host}:{port}");
+    let now = Instant::now();
+    let mut m = TUNNEL_BREAKER.lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.entry(key).or_insert((0, now, now));
+    e.0 = e.0.saturating_add(1);
+    let should_log =
+        e.0 == TUNNEL_FAIL_THRESHOLD || now.duration_since(e.2) >= TUNNEL_LOG_THROTTLE;
+    // 冷却起点：首次达阈值，或旧冷却已过期后再次失败（重新进入冷却）
+    if e.0 == TUNNEL_FAIL_THRESHOLD || now.duration_since(e.1) >= TUNNEL_COOLDOWN {
+        e.1 = now;
+    }
+    if should_log {
+        e.2 = now;
+    }
+    should_log
+}
+
+/// 建连成功（任一路径）后清除熔断计数
+fn tunnel_breaker_ok(host: &str, port: u16) {
+    let key = format!("{host}:{port}");
+    TUNNEL_BREAKER.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+}
+
+/// 代理实例启动时清空熔断状态（审查修复 I4）：TUNNEL_BREAKER 为进程级 static，
+/// 同进程内代理 stop→start 不清空会让上一生命期失败达阈值的主机在剩余冷却
+/// 窗口（≤60s）内仍被 502 快速失败；新实例应从零开始探测
+fn tunnel_breaker_reset() {
+    TUNNEL_BREAKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
 
 /// 默认解密域名白名单（语义对齐 Charles SSL Proxying Locations：列表内域解密，
 /// 其余 CONNECT 透明直通；桌面端设置页 PROXY_DOMAINS 可覆盖）。
@@ -155,6 +227,8 @@ pub struct ProxyServer {
 impl ProxyServer {
     /// 启动进程内代理（对齐 Python `main()`：ensure_ca → 设备标识同步 → 独占绑定 → accept 循环）
     pub async fn start(cfg: ProxyConfig, app: Option<tauri::AppHandle>) -> Result<ProxyServer, String> {
+        // 审查修复：熔断状态跨代理重启残留（I4）——新实例启动时清空，从零探测
+        tunnel_breaker_reset();
         // CA 证书：兼容已有 Python 版 RSA CA；缺失则生成（数据目录布局不变）
         let ca = Arc::new(ensure_ca(&cfg.certs_dir)?);
 
@@ -472,6 +546,11 @@ async fn tunnel_raw<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // 熔断（issue #209）：冷却期内直接快速失败，不重复 20s+ 直连探测
+    if tunnel_breaker_open(host, port) {
+        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+        return;
+    }
     let mut pre: Option<TcpStream> = None;
     if direct_domains.iter().any(|d| host_matches_domain(host, d)) {
         // 直连白名单域（p3-2e）：先直连，失败回退上游兜底
@@ -497,11 +576,24 @@ async fn tunnel_raw<S>(
                             log.log(&format!(
                                 "  [raw-tunnel] 隧道建立失败 {host}:{port}: 直连({e})与上游({e2})均失败"
                             ));
+                            // 双路皆死同样计入熔断（审查修复 2026-11-18）：60s 冷却远小于
+                            // 20s+ 直连探测重试风暴的代价，且上游兜底已证不可用
+                            if tunnel_breaker_fail(host, port) {
+                                log.log(&format!(
+                                    "  [raw-tunnel] {host}:{port} 连续失败达阈值，冷却 {TUNNEL_COOLDOWN:?} 内快速失败"
+                                ));
+                            }
                             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                             return;
                         }
                     }
                 } else {
+                    // 白名单域直连失败且无上游：同样计入熔断（审查修复 2026-11-18）
+                    if tunnel_breaker_fail(host, port) {
+                        log.log(&format!(
+                            "  [raw-tunnel] {host}:{port} 连续失败达阈值，冷却 {TUNNEL_COOLDOWN:?} 内快速失败"
+                        ));
+                    }
                     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     return;
                 }
@@ -521,13 +613,18 @@ async fn tunnel_raw<S>(
         None => match connect_direct(host, port).await {
             Ok(s) => s,
             Err(e) => {
-                // 建连不可达：明确告知客户端，避免浏览器无限等待
-                log.log(&format!("  [raw-tunnel] 隧道建立失败 {host}:{port}: {e}"));
+                // 建连不可达：明确告知客户端，避免浏览器无限等待；失败入熔断计数
+                if tunnel_breaker_fail(host, port) {
+                    log.log(&format!(
+                        "  [raw-tunnel] 隧道建立失败 {host}:{port}: {e}（连续失败达阈值，冷却 {TUNNEL_COOLDOWN:?} 内快速失败）"
+                    ));
+                }
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return;
             }
         },
     };
+    tunnel_breaker_ok(host, port);
     // 完成 CONNECT 握手：先回 200，客户端随后才会发送 TLS ClientHello
     if client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
         return;

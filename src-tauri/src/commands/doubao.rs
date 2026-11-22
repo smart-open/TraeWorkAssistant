@@ -1041,7 +1041,7 @@ fn update_quota_cache(state: &State<AppState>, uid: &str, parsed: &serde_json::V
             .and_then(|a| a.session_id.clone().map(|sid| (sid, a.sid_guard.clone())))
             .and_then(|(sid, sg)| {
                 let agent = crate::tasks::http_agent(8);
-                crate::tasks::doubao_checkin::detail_probe(&agent, &sid, sg.as_deref(), None)
+                crate::tasks::doubao_checkin::detail_probe(&agent, &state.data_dir, &sid, sg.as_deref(), None)
             })
     };
     // 读-改-写互斥：罩住 load→改→save 段，防旧副本整文档覆盖
@@ -1608,6 +1608,8 @@ pub struct DoubaoDashboardStats {
     pub today_ok: u64,
     pub today_already: u64,
     pub today_failed: u64,
+    /// 今日确定性跳过（未投放/无任务；3.9.4 起 skip 独立落库，不计失败）
+    pub today_skip: u64,
     /// 最高连续签到天数（展示用）
     pub max_continuous_days: Option<i64>,
     /// 最近 30 天趋势（日期升序）
@@ -1641,12 +1643,13 @@ pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardS
     // 改用 trend_from 直接复用已加载结构，打开卡顿修复的减半项）
     let results = crate::doubao_checkin_results::load(&state.data_dir);
     let today = crate::doubao_checkin_results::today_key();
-    let (today_ok, today_already, today_failed, today_reward) = results
+    let (today_ok, today_already, today_skip, today_failed, today_reward) = results
         .days
         .get(&today)
         .map(|day| {
             let mut ok = 0u64;
             let mut already = 0u64;
+            let mut skipped = 0u64;
             let mut failed = 0u64;
             let mut reward = 0i64;
             for st in day.accounts.values() {
@@ -1656,12 +1659,15 @@ pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardS
                         reward += st.reward.unwrap_or(0);
                     }
                     "already" => already += 1,
+                    // skip（未投放/无任务）单列，不计失败（与 trend_from 口径一致；
+                    // 审查修复：落进 failed 会虚增今日失败率、与趋势图灰柱矛盾）
+                    "skip" => skipped += 1,
                     _ => failed += 1,
                 }
             }
-            (ok, already, failed, reward)
+            (ok, already, skipped, failed, reward)
         })
-        .unwrap_or((0, 0, 0, 0));
+        .unwrap_or((0, 0, 0, 0, 0));
     let trend = crate::doubao_checkin_results::trend_from(&results, 30);
     Ok(DoubaoDashboardStats {
         account_count: pool.accounts.len() as u64,
@@ -1671,6 +1677,7 @@ pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardS
         today_ok,
         today_already,
         today_failed,
+        today_skip,
         max_continuous_days: max_continuous,
         trend,
     })
@@ -1681,7 +1688,7 @@ pub fn doubao_dashboard_stats(state: State<AppState>) -> Result<DoubaoDashboardS
 pub struct DoubaoDayAccountResult {
     pub user_id: String,
     pub name: String,
-    /// success | already | fail
+    /// success | already | skip | fail
     pub status: String,
     /// 签到奖励额度（success 时非空）
     pub reward: Option<i64>,

@@ -2,6 +2,8 @@
  * 豆包签到档期日历数据适配（CheckinCalendarCard 的数据源转换）。
  * 纯函数：doubao_checkin_results_detail（按日逐账号明细）→ CheckinCalendarDay[]。
  * 口径：success / already 均计 ok（已签 = 之前已成功，标记成功）；fail 计 fail；
+ * skip（未投放/无任务）不计 ok/fail——中性灰点 + 原因进 note（与 WB/Qoder
+ * 日历口径一致，审查修复：skip 落入 ok 会渲染绿点「已领」误导用户）；
  * 当日奖励合计 = 各账号 reward 之和（success 时非空）。
  */
 import type { CheckinCalendarDay, CheckinCalendarEntry } from './checkinCalendarModel';
@@ -19,6 +21,11 @@ export function daysFromDoubaoDetail(detail: DoubaoDayDetail[]): CheckinCalendar
         //（风控 710010702 / 凭证过期 710012001 等可定性），不再只显示笼统「失败」
         const reason = (r.message ?? '').trim();
         return { name: r.name, status: 'fail', note: reason || undefined };
+      }
+      if (r.status === 'skip') {
+        // skip：中性灰点 + 原因进 note，不计 ok/fail（审查修复）
+        const reason = (r.message ?? '').trim();
+        return { name: r.name, status: 'skip', note: reason || undefined };
       }
       ok += 1;
       const rw = r.reward ?? 0;

@@ -178,6 +178,17 @@ fn clear_model_cooldown(model: &str) {
         .remove(model);
 }
 
+/// 清空全部模型级冷却（accounts cooldown_clear_all 联动，P2 审查修复）：
+/// 返回清除条目数。Qoder 模型冷却是进程级静态表（QODER_MODEL_COOLDOOWNS 前身
+/// 备忘：挂静态 OnceLock 而非 ApiSharedState），网关「清除冷却」按钮必须显式
+/// 覆盖，否则 Server 类 5xx 渐进冷却（最长 480s）在清理后依然生效。
+pub fn clear_all_model_cooldowns() -> usize {
+    let mut map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.len();
+    map.clear();
+    n
+}
+
 /// last_error 时间戳（UTC+8，与 app 日志时间线同区，issue #90 修复②）：
 /// 504 类上游异常是否持续、何时开始，用户此前只能靠猜（正是「切换模型导致」
 /// 误解的成因），带时刻后可与日志逐行对照
@@ -2061,7 +2072,7 @@ pub async fn qoder_aggregate_chat(
                             &model,
                         );
                         // P1-2：流式收集阶段按胜者尝试的别名表回改工具名（resp 已是原名）
-                        let (resp, error) =
+                        let (resp, error, _eof_truncated) =
                             wb_sse::aggregate(translated, &agg_chat_id, tool_alias.as_ref());
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         // P2-2：传输层掐断优先于一切结果——聚合遇 EOF 掐断会返回
@@ -2774,7 +2785,7 @@ mod tests {
         let lines = vec![format!("data: {envelope}"), String::new()].into_iter();
         let translated =
             qoder_upstream::QoderTranslate::new(lines, slot.clone(), "chatcmpl-t", "m");
-        let (resp, error) = wb_sse::aggregate(translated, "chatcmpl-t", None);
+        let (resp, error, _eof) = wb_sse::aggregate(translated, "chatcmpl-t", None);
         assert!(resp.is_none() && error.is_some(), "信封错误应落解码错误分支");
         let meta = slot.lock().unwrap().clone();
         meta

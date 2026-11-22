@@ -3031,7 +3031,7 @@ mod tests {
         let reader = std::io::Cursor::new(text.into_bytes());
         let ilines = open_qoder_stream(Box::new(reader), slot, "chat-1", "M")
             .expect("首字正常应成功");
-        let (completion, err) = wb_sse::aggregate(ilines, "chat-1", None);
+        let (completion, err, _eof) = wb_sse::aggregate(ilines, "chat-1", None);
         assert!(err.is_none(), "无流内错误");
         let completion = completion.expect("必须聚合出 completion");
         assert_eq!(completion["choices"][0]["message"]["content"], "你好");

@@ -951,6 +951,13 @@ pub fn stream_forward_ex(
     // 上抛——调用方按失败落账（不绑粘性不记成功）；零内容时覆盖空完成哨兵
     //（调用方换号且不计空完成指纹）。「正常 Done 收尾」守卫复用 saw_done
     //（macos_main 命名，语义同 main 侧 finished）
+    // issue #213 S1b（轻量处理）：本函数返回值是五元组（调用方多处解构，第 5 元
+    // eof_truncated 为 macos_main 扩展），
+    // 断流现场字段 sent_bytes / last_frame_kind（累计 payload 字节数、最后
+    // 帧类型 Chunk/Error/Done）暂不追加——改动面过大；归因现场可用信息 =
+    // has_content（本函数局部）+ 上抛的底层读错误文本（已含在哨兵 msg 中，
+    // 覆盖 cut 关键词库 mod.rs::is_transport_cut_text 全部形态）。后续如需
+    // 字节级断点归因，先把返回值升级为结构体再补两字段。
     if error_info.is_none() && !saw_done && !failed_inline {
         if let Some(e) = parser.take_read_error() {
             error_info = Some((
@@ -993,24 +1000,34 @@ pub fn stream_forward_ex(
 
 /// 非流式聚合：WB SSE → 内部 OpenAI completion（tool_calls 按 index 合并）
 /// 返回 (completion|None, error|None)
+/// 聚合解析：SSE 行流 → 单个 OpenAI completion JSON。
+/// 返回 (响应, 流内错误, EOF 截断)。EOF 截断 = 安静 EOF（未收到 Done/Error 且
+/// 无底层读错误）但已有内容（macos_main 合并审查：对齐流式路径 eof_truncated
+/// 口径——伪流式（issue #213）把聚合结果合成为「正常收尾」SSE 帧下发，截断
+/// 不上抛会彻底丢失观测；残缺内容当前仍按成功交付（与流式一致：观测不重试，
+/// 防对合法无 Done 收尾的上游造成重试风暴），是否升级为换号重试另行评估）。
 pub fn aggregate<L: Iterator<Item = String>>(
     lines: L,
     chat_id: &str,
     tool_alias: Option<&ToolAliasReverse>,
-) -> (Option<Value>, Option<(i64, String)>) {
+) -> (Option<Value>, Option<(i64, String)>, bool) {
     let mut parser = WbSseParser::new(lines);
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut finish = String::new();
     let mut usage: Option<Value> = None;
+    let mut saw_done = false;
     // index → (id, name, args)
     let mut tools: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
 
     loop {
         match parser.next_event() {
             None => break,
-            Some(WbEvent::Done) => break,
-            Some(WbEvent::Error { code, msg }) => return (None, Some((code, msg))),
+            Some(WbEvent::Done) => {
+                saw_done = true;
+                break;
+            }
+            Some(WbEvent::Error { code, msg }) => return (None, Some((code, msg)), false),
             Some(WbEvent::Chunk { delta, finish: f, usage: u, .. }) => {
                 if let Some(x) = u {
                     usage = Some(x);
@@ -1089,7 +1106,15 @@ pub fn aggregate<L: Iterator<Item = String>>(
     if let Some(u) = usage {
         resp["usage"] = u;
     }
-    (Some(resp), None)
+    // 安静 EOF 判定：无 Done 且已有内容/思考链/工具调用（审查修复：对齐流式
+    // frame_has_payload 口径——reasoning 也在 payload 面，模型在思考链中途被
+    // 上游安静 EOF 掐断时正文/工具调用为空，漏判会把残缺响应当完整成功交付
+    // 且零观测）。解析器本身无 read-error 概念（行源无错误通道，读错误经 P2-2
+    // 槽在调用方合并——届时成功分支不会到达，本旗标自然失效），此处 !saw_done
+    // 即纯安静 EOF
+    let eof_truncated =
+        !saw_done && (!content.is_empty() || !reasoning.is_empty() || !tools.is_empty());
+    (Some(resp), None, eof_truncated)
 }
 
 /// OpenAI finish_reason → Anthropic stop_reason 映射（P1 修复）
@@ -1594,8 +1619,9 @@ mod tests {
             "chat-1",
             None,
         );
-        let (resp, err) = out;
+        let (resp, err, eof) = out;
         assert!(err.is_none());
+        assert!(!eof, "正常 Done 收尾不得误报截断");
         let r = resp.unwrap();
         let msg = &r["choices"][0]["message"];
         assert_eq!(msg["content"], json!("done"));
@@ -1607,7 +1633,7 @@ mod tests {
 
     #[test]
     fn aggregate_reports_error_before_any_content() {
-        let (resp, err) = aggregate(
+        let (resp, err, _eof) = aggregate(
             lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]),
             "c",
             None,
@@ -1617,8 +1643,32 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_quiet_eof_truncation_with_content_is_reported() {
+        // macos_main 合并审查：安静 EOF（未收到 Done/Error）+ 有内容 → 第三元置位
+        //（对齐流式 eof_truncated 观测口径，伪流式合成帧前调用方可标注）
+        let (_, _, eof) = aggregate(
+            lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}", ""]),
+            "c1",
+            None,
+        );
+        assert!(eof, "安静 EOF 有内容应报告截断");
+        // 思考链-only 安静 EOF：reasoning 同属 payload 面（与流式 frame_has_payload
+        // 口径对齐，审查修复回归）
+        let (_, _, eof3) = aggregate(
+            lines(&["data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"思考\"}}]}", ""]),
+            "c3",
+            None,
+        );
+        assert!(eof3, "安静 EOF 仅有思考链也应报告截断");
+        // 零内容安静 EOF：空响应不算截断（空完成由调用方哨兵处理）
+        let (resp, _, eof2) = aggregate(lines(&[""]), "c2", None);
+        assert!(!eof2);
+        assert!(resp.is_some());
+    }
+
+    #[test]
     fn converters_roundtrip() {
-        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1", None);
+        let (resp, _, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1", None);
         let v = resp.unwrap();
         let anth = completion_to_anthropic(&v, "msg_1", "glm-5.3", None);
         assert_eq!(anth["type"], json!("message"));

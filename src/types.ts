@@ -399,6 +399,8 @@ export interface Settings {
   doubao_checkin_hhmm: string;
   /** 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期时自动开代理+切客户端抓包对齐 */
   doubao_probe_auto_keepalive: boolean;
+  /** 豆包保活单账号等待抓包秒数（默认 75；0/未配置 = 回退默认；后端读取侧 clamp 1..=600） */
+  doubao_probe_keepalive_wait_secs: number | null;
   /** 豆包数据同步模式：off/hourly/every_hours/every_days/daily（默认 every_hours） */
   doubao_sync_mode: string;
   /** 豆包数据同步 every_hours 间隔小时数（1-24，默认 2） */
@@ -496,6 +498,8 @@ export interface Settings {
   notify_on_checkin: boolean;
   /** 调度任务失败时推送（默认开） */
   notify_on_task_fail: boolean;
+  /** 定时调度任务完成时推送（issue #222；默认关——成功推送易耗尽 Server酱免费档每日 5 条） */
+  notify_on_task_success: boolean;
   /** Bark 推送地址（https://api.day.app/<key>；空 = 关闭该渠道） */
   notify_bark_url: string | null;
   /** 通用 Webhook 地址（POST JSON，兼容企业微信群机器人等自建端；空 = 关闭） */
@@ -1112,6 +1116,8 @@ export interface DoubaoCheckinTrendPoint {
   date: string;
   ok: number;
   already: number;
+  /** 当日确定性不可签到（未投放/task_status≠2）单列计数，不并入 already */
+  skip: number;
   failed: number;
   reward_total: number;
 }
@@ -1125,6 +1131,8 @@ export interface DoubaoDashboardStats {
   today_ok: number;
   today_already: number;
   today_failed: number;
+  /** 今日确定性跳过（未投放/无任务，不计失败） */
+  today_skip: number;
   max_continuous_days: number | null;
   trend: DoubaoCheckinTrendPoint[];
 }
@@ -1133,7 +1141,7 @@ export interface DoubaoDashboardStats {
 export interface DoubaoDayAccountResult {
   user_id: string;
   name: string;
-  /** success | already | fail */
+  /** success | already | skip | fail */
   status: string;
   /** 签到奖励额度（success 时非空） */
   reward: number | null;
@@ -1337,6 +1345,19 @@ export interface SanitizeSwitches {
   qoder: boolean;
 }
 
+// 池级伪流式开关视图（issue #213 S7）：仅内存热切换、重启复位默认关
+// wb = Buddy CN 档（wb_pool）；buddy_ai = 国际档独立灰度
+export interface PseudoStreamSwitches {
+  wb: boolean;
+  buddy_ai: boolean;
+}
+
+// 池级换号重试预算视图（issue #213 阶段2）：0 = 旧行为（重试机会 = 池内账号数）
+export interface RetryBudgets {
+  wb: number;
+  buddy_ai: number;
+}
+
 // ---- 工具名别名表（issue #150：tool_alias_map KV；Trae 池 tools 工具集指纹识别治本）----
 // 请求侧 tools[].function.name / tool_choice / 历史轮 tool_calls 名 → 通用别名，
 // 响应侧按逆映射回改（协议对客户端透明）。合并语义同指纹清洗：内置默认表始终
@@ -1489,6 +1510,8 @@ export interface WorkBuddyAccountView {
   relogin_reason: string;
   group_id: string;
   note: string;
+  /** 账号级独立出口代理 URL（P4 防风控；null/空 = 直连，老后端缺省 undefined） */
+  proxy_url?: string | null;
   credits_balance: number | null;
   credits_fetched_at: string | null;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
@@ -1985,6 +2008,10 @@ export interface QoderCheckinLine {
   status: 'success' | 'already' | 'fail' | 'skip';
   message?: string;
   reward?: number;
+  /** 结构化失败/跳过类别（P3-16 审查修复消费字段）：empty_campaigns=无签到任务 /
+   * experience_ineligible=体验版未满足资格 / blocked_need_trust=风控拦截；
+   * skip 分类展示按此字段判定，不再耦合 message 文案（历史记录同名字段共用） */
+  fail_kind?: string;
 }
 
 /** 签到完成汇总（done 事件归约产物） */
@@ -1992,11 +2019,16 @@ export interface QoderCheckinDone {
   ok: number;
   already: number;
   failed: number;
-  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  /** 无签到任务跳过数（empty_campaigns：活动未开放/账号不在投放范围）：
+   * 不计入 failed（口径对齐 Rust skipped_empty_campaigns，2026-11-21 起 skip）；
+   * 人工「开始签到」轮次 empty>0 时前端弹框提示官网 */
   empty: number;
   /** failed 中「风控信任未建立（BLOCKED）」数：恢复需用户操作（切换账号+客户端建信任），
    * 自动重试无效（issue #190，口径对齐 Rust 侧） */
   blocked: number;
+  /** 确定性跳过数（体验版账号未满足每日 100 Credits 活动资格，issue #223）：
+   * 不计入 failed，不重试不推送（口径对齐 Rust 侧） */
+  skipped_ineligible: number;
 }
 
 export interface QoderCreditPackage {

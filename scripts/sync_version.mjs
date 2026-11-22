@@ -11,6 +11,7 @@
  *   - src-tauri/tauri.conf.json      已移除 version 字段（自动回读 Cargo.toml）
  *   - src/lib/about.ts               已移除 APP_VERSION 硬编码（运行时 getVersion()）
  *   - package.json                   本脚本写入
+ *   - package-lock.json              本脚本写入（根级 + packages[""] 两处，3.9.4/3.9.5 曾遗漏）
  *   - AGENT.md 标题                  本脚本写入
  */
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -21,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CARGO_TOML = resolve(ROOT, 'src-tauri/Cargo.toml');
 const PACKAGE_JSON = resolve(ROOT, 'package.json');
+const PACKAGE_LOCK = resolve(ROOT, 'package-lock.json');
 const AGENT_MD = resolve(ROOT, 'AGENT.md');
 
 const die = (msg) => {
@@ -54,6 +56,26 @@ function syncPackageJson(version) {
   data.version = version;
   // 与原 Python 版输出对齐：2 空格缩进 + 末尾换行，中文原样
   writeFileSync(PACKAGE_JSON, JSON.stringify(data, null, 2) + '\n');
+}
+
+/** package-lock.json 两处 version（根级 + packages[""]）必须与 package.json 一致，
+ *  否则 npm ci / 部分校验报 EUSAGE lock 版本不匹配。3.9.4/3.9.5 升版曾两次遗漏，
+ *  收敛进脚本后不再依赖手工同步。 */
+function syncPackageLock(version) {
+  const raw = readFileSync(PACKAGE_LOCK, 'utf8');
+  const data = JSON.parse(raw);
+  let n = 0;
+  if (data.version !== undefined) {
+    data.version = version;
+    n++;
+  }
+  if (data.packages?.['']?.version !== undefined) {
+    data.packages[''].version = version;
+    n++;
+  }
+  if (n !== 2) die(`package-lock.json 结构异常：仅更新了 ${n}/2 处 version，请人工检查`);
+  // 2 空格缩进 + 末尾换行（与 npm 生成格式一致）
+  writeFileSync(PACKAGE_LOCK, JSON.stringify(data, null, 2) + '\n');
 }
 
 function syncAgentMd(version) {
@@ -91,6 +113,7 @@ if (target) {
 
 const version = readCargoVersion();
 syncPackageJson(version);
+syncPackageLock(version);
 syncAgentMd(version);
-console.log(`[sync_version] 版本已同步为 ${version}：package.json / AGENT.md / Cargo.lock 已对齐`);
+console.log(`[sync_version] 版本已同步为 ${version}：package.json / package-lock.json / AGENT.md / Cargo.lock 已对齐`);
 console.log('[sync_version] tauri.conf.json 与 about.ts 无需改动（自动跟随 Cargo.toml）');

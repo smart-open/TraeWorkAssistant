@@ -22,9 +22,12 @@ type Scope = 'all' | 'group' | 'selected';
 interface ResultLine {
   userId: string;
   name: string;
-  status: 'success' | 'already' | 'fail';
+  status: 'success' | 'already' | 'skip' | 'fail';
   message?: string;
   reward?: number;
+  /** P3-13 审查修复：landinig/checkin 直签成功但响应缺 reward（服务端确认中）——
+   *  行内标「确认中」，不计入新增额度合计，防止 200 伪装到账 */
+  pending?: boolean;
 }
 
 /** 豆包 · 一键签到（参考 Trae 一键签到页：范围选择 + 账号勾选 + 逐账号结果 + 活动档期日历）。
@@ -44,7 +47,10 @@ export default function DoubaoCheckin() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<ResultLine[]>([]);
-  const [summary, setSummary] = useState<{ ok: number; failed: number; reward: number } | null>(null);
+  const [summary, setSummary] = useState<{ ok: number; failed: number; skipped: number; reward: number } | null>(null);
+  // 「获取额度」列数据源：uid → 今日签到获得额度（按日落库）。未签/失败/跳过为 0；
+  // 成功/已签展示实际奖励，回执无 reward（旧数据/捕获链路缺字段）按 200 展示
+  const [todayRewards, setTodayRewards] = useState<Record<string, number>>({});
 
   // 组件存活标记：切页卸载后终止批量签到循环（单账号 invoke 超时 600s，不守卫会后台继续发真实签到请求；
   // 重进页面是新实例、running 归零，不守卫还会造成并发双跑）
@@ -77,6 +83,19 @@ export default function DoubaoCheckin() {
       setAccounts(accs);
       setGroups(gs);
       setCalDays(daysFromDoubaoDetail(det));
+      const rewards: Record<string, number> = {};
+      for (const d of det) {
+        if (d.date !== today) continue;
+        for (const r of d.accounts) {
+          rewards[r.user_id] =
+            r.status === 'success' || r.status === 'already'
+              ? Number(r.reward) > 0
+                ? Number(r.reward)
+                : 200
+              : 0;
+        }
+      }
+      setTodayRewards(rewards);
     } catch (err) {
       if (!aliveRef.current) return;
       pushToast('error', `读取豆包账号失败：${String(err)}`);
@@ -120,6 +139,7 @@ export default function DoubaoCheckin() {
     setSummary(null);
     let ok = 0;
     let failed = 0;
+    let skipped = 0;
     let reward = 0;
     // 失败首因 + probe 保活错误（失败排障透出，2026-11-07）：收尾 toast 不再只报计数——
     // 全失败时用户只看到「失败 N」无法定性（probe 未对齐风控拒 vs 凭证过期 vs 无资格）。
@@ -134,7 +154,13 @@ export default function DoubaoCheckin() {
       if (!aliveRef.current) return;
       try {
         const r = (await api.doubao.checkinRun(a.user_id)) as {
-          outcome?: { status?: string; message?: string; reward?: number };
+          outcome?: {
+            status?: string;
+            message?: string;
+            reward?: number;
+            // P3-13 审查修复：后端 success 分支显式标记（false = 服务端确认中形态）
+            reward_present?: boolean;
+          };
           probe_keepalive_error?: string | null;
         };
         // 首因语义（审查 L-2）：首个非空值胜——probe_keepalive_error 仅首个触发
@@ -146,14 +172,34 @@ export default function DoubaoCheckin() {
           failed += 1;
           if (!firstFailMsg) firstFailMsg = (o?.message ?? '').trim();
           setLines((prev) => [...prev, { userId: a.user_id, name: a.name, status: 'fail', message: o?.message }]);
+        } else if (st === 'skip') {
+          // skip（审查 #8）：确定性不可签到（未投放/task_status≠2）——不计失败不计成功，
+          // 单独展示跳过原因（完整语义与后端 skip 状态贯通）
+          skipped += 1; // 审查修复 2026-11-18：计入 summary，收尾透出（原实现仅行内展示，汇总数与进度行数对不上）
+          setLines((prev) => [
+            ...prev,
+            { userId: a.user_id, name: a.name, status: 'skip', message: o?.message },
+          ]);
         } else {
           // success / already 均视为当日已签（已签 = 之前已成功，标记成功）
           ok += 1;
-          const rw = Number(o?.reward ?? 0) || 0;
-          reward += rw;
+          // P3-13 审查修复：reward_present=false（服务端「确认中」形态）不再补 0
+          // 伪装到账——行内标「确认中」，不计入本次新增额度合计（防虚报）；额度以
+          // detail 复查/按日落库为准。判定用显式标记而非 `'reward' in o`（后端恒写
+          // reward 键，键存在性判定恒真为死代码，审查修复）
+          const pendingReward = o?.reward_present === false;
+          const rw = pendingReward ? 0 : Number(o?.reward ?? 0) || 0;
+          if (!pendingReward) reward += rw;
           setLines((prev) => [
             ...prev,
-            { userId: a.user_id, name: a.name, status: st === 'already' ? 'already' : 'success', message: o?.message, reward: rw },
+            {
+              userId: a.user_id,
+              name: a.name,
+              status: st === 'already' ? 'already' : 'success',
+              message: pendingReward ? '签到已提交，额度确认中（以复查结果为准）' : o?.message,
+              reward: pendingReward ? undefined : rw,
+              pending: pendingReward,
+            },
           ]);
         }
       } catch (err) {
@@ -164,7 +210,7 @@ export default function DoubaoCheckin() {
     }
     // 卸载后跳过全部收尾（组件已销毁，running 无需复位；pushToast/reload 均为多余副作用）
     if (!aliveRef.current) return;
-    setSummary({ ok, failed, reward });
+    setSummary({ ok, failed, skipped, reward });
     setRunning(false);
     // 失败时透出首因与 probe 保活状态（各自截断防 toast 过长；完整原因见结果列表行
     // 与按日落库 message，重开页面日历明细仍可查）。probeHint 仅失败>0 时拼接——
@@ -175,7 +221,7 @@ export default function DoubaoCheckin() {
     const probeHint = failed > 0 && probeErr ? `；抓包参数未对齐（${probeErr.slice(0, 60)}）——易被风控拒绝，请开启代理并保持豆包客户端打开后重试` : '';
     pushToast(
       failed > 0 ? 'warn' : 'success',
-      `签到完成：成功 ${ok} · 失败 ${failed}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,
+      `签到完成：成功 ${ok} · 失败 ${failed}${skipped > 0 ? ` · 跳过 ${skipped}` : ''}${reward > 0 ? ` · 新增额度 +${reward.toLocaleString()}` : ''}${failHint}${probeHint}`,
     );
     await reload();
   };
@@ -183,6 +229,7 @@ export default function DoubaoCheckin() {
   const lineIcon = (st: ResultLine['status']) => {
     if (st === 'success') return <CheckCircle2 size={14} className="text-emerald-500" />;
     if (st === 'already') return <CircleSlash size={14} className="text-sky-500" />;
+    if (st === 'skip') return <CircleSlash size={14} className="text-slate-400" />;
     return <XCircle size={14} className="text-rose-500" />;
   };
 
@@ -308,7 +355,7 @@ export default function DoubaoCheckin() {
                     <th className="whitespace-nowrap px-3 py-2 text-left">账号</th>
                     <th className="whitespace-nowrap px-3 py-2 text-left">会话</th>
                     <th className="whitespace-nowrap px-3 py-2 text-left">今日</th>
-                    <th className="whitespace-nowrap px-3 py-2 text-left">额度</th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left">获取额度</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -353,10 +400,12 @@ export default function DoubaoCheckin() {
                         </td>
                         <td className="whitespace-nowrap px-3 py-2">{todayBadge(a)}</td>
                         <td className="whitespace-nowrap px-3 py-2 text-xs tabular-nums">
-                          {a.quota_total != null ? (
-                            <span className="font-medium text-amber-600 dark:text-amber-400">{a.quota_total.toLocaleString()}</span>
+                          {(todayRewards[a.user_id] ?? 0) > 0 ? (
+                            <span className="font-medium text-amber-600 dark:text-amber-400">
+                              +{(todayRewards[a.user_id] ?? 0).toLocaleString()}
+                            </span>
                           ) : (
-                            <span className="text-slate-400">—</span>
+                            <span className="text-slate-400">0</span>
                           )}
                         </td>
                       </tr>
@@ -391,6 +440,7 @@ export default function DoubaoCheckin() {
                 {summary ? (
                   <Badge tone={summary.failed > 0 ? 'amber' : 'green'}>
                     完成：成功 {summary.ok} · 失败 {summary.failed}
+                    {summary.skipped > 0 ? ` · 跳过 ${summary.skipped}` : ''}
                     {summary.reward > 0 ? ` · +${summary.reward.toLocaleString()}` : ''}
                   </Badge>
                 ) : (
@@ -405,10 +455,14 @@ export default function DoubaoCheckin() {
                     <span className="font-medium">{l.name}</span>
                     <span className="text-slate-500">
                       {l.status === 'success'
-                        ? `签到成功${l.reward ? ` · +${l.reward.toLocaleString()} 额度` : ''}`
+                        ? l.pending
+                          ? '签到已提交 · 额度确认中（以复查结果为准）' // P3-13：服务端确认中形态，不伪装到账
+                          : `签到成功${l.reward ? ` · +${l.reward.toLocaleString()} 额度` : ''}`
                         : l.status === 'already'
                           ? '今天已签过（幂等跳过，计成功）'
-                          : `失败：${l.message ?? '未知错误'}`}
+                          : l.status === 'skip'
+                            ? `跳过：${l.message ?? '今日不可签到'}`
+                            : `失败：${l.message ?? '未知错误'}`}
                     </span>
                   </div>
                 ))}

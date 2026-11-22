@@ -844,9 +844,27 @@ impl ApiPool {
         dedicated: Option<&str>,
         skip_credit_filters: bool,
     ) -> Option<(PickedAccount, Option<String>)> {
-        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
+        // issue #206：委托谓词版本，恒真谓词 = 既有行为零变化
+        self.pick_excluding_constrained_ev_matching(
+            tried, allowed, dedicated, skip_credit_filters, &|_| true,
+        )
+    }
+
+    /// 同 [pick_excluding_constrained_ev]，附加账号×模型冷却谓词过滤（issue #206）：
+    /// `model_filter(uid)` 返回 false = 该账号对此模型不可用（(uid, model) 冷却中，
+    /// 上游 429 为模型维度限流）。谓词在池锁内调用，须只读外部状态、不得回调池方法
+    pub fn pick_excluding_constrained_ev_matching(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        skip_credit_filters: bool,
+        model_filter: &dyn Fn(&str) -> bool,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）；
+        // 绑定账号同样过模型过滤——冷却中则视为不可用，由调用方走无健康收尾
         if let Some(uid) = dedicated {
-            if !tried.contains(uid) {
+            if !tried.contains(uid) && model_filter(uid) {
                 if let Some(p) = self.pick_by_uid(uid, skip_credit_filters) {
                     self.touch_last_used(uid);
                     return Some((p, None));
@@ -861,7 +879,9 @@ impl ApiPool {
             .values()
             .filter(|e| selectable(e, tried, now, reserve, skip_credit_filters))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| model_filter(&e.uid))
             .collect();
+
         // F-77 busy 过滤 + 全 busy 降级
         let inflight = self.inflight_snapshot();
         let limit = self.concurrency_limit();
@@ -1121,19 +1141,30 @@ impl ApiPool {
         let now = now_ts();
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
+        let mut state_ev: Option<String> = None; // issue #220 P3：状态跃迁告警文案
         if let Some(e) = entries.get_mut(uid) {
             e.failures = e.failures.saturating_add(1);
             let mut action: Option<String> = None;
             match kind {
                 ErrKind::SessionDead | ErrKind::Forbidden => {
+                    let fresh = !e.disabled;
                     e.disabled = true;
                     e.reason = kind.as_str().to_string();
                     action = Some("action=disabled".to_string());
+                    // issue #220 P3：Forbidden 首次禁用跃迁才告警（SessionDead 可由
+                    // 凭证轮换自愈不推；重复 11140 由跃迁判定 + 24h 冷却双重防刷屏）
+                    if kind == ErrKind::Forbidden && fresh {
+                        state_ev = Some(format!(
+                            "账号「{}」被上游限制（Forbidden），已临时停用",
+                            e.name
+                        ));
+                    }
                 }
                 ErrKind::HardCredit => {
                     // 积分耗尽：优先上游解冻时刻（issue #159），缺省冷却到下个
                     // 04:00（凌晨 00:00–04:00 窗口内为当天，next_0400 语义），
                     // 到期自动恢复探测（F-29 v1.2）
+                    let fresh_hard = e.hard_until <= now; // 原无活跃硬冷却 = 本次跃迁
                     let until = match unfreeze {
                         Some(u) => clamp_unfreeze(u, now),
                         None => next_0400(now),
@@ -1141,6 +1172,10 @@ impl ApiPool {
                     e.hard_until = until;
                     e.reason = "hard_credit".to_string();
                     e.err_count = 0;
+                    // issue #220 P3：积分耗尽跃迁告警（重复命中不刷屏）
+                    if fresh_hard {
+                        state_ev = Some(format!("账号「{}」积分耗尽，已进入保护冷却", e.name));
+                    }
                     action = Some(format!(
                         "action=hard_cooldown until={} ({})",
                         fmt_local_ts(until),
@@ -1207,6 +1242,21 @@ impl ApiPool {
                         "account cooldown: pool={label} acct={name} uid={uid} kind={} {ev}",
                         kind.as_str(),
                     ),
+                );
+            }
+        }
+        // issue #220 P3：状态跃迁主动告警（per-account × per-event 24h 冷却防重；
+        // log_ctx 未装配（测试/未启动）静默跳过；经全局句柄弹桌面通知 + 渠道（审查修复 #2）
+        if let Some(body) = state_ev {
+            let ctx = safe_lock(&self.log_ctx).clone();
+            if let Some((dir, label)) = ctx {
+                crate::notify::notify_account_state(
+                    crate::notify::global_app(),
+                    &dir,
+                    uid,
+                    kind.as_str(),
+                    &format!("账号状态告警（{label}）"),
+                    &body,
                 );
             }
         }
@@ -1299,6 +1349,26 @@ impl ApiPool {
         skip_credit_filters: bool,
     ) -> bool {
         self.selectable_stats_in(allowed, skip_credit_filters).1 > 0
+    }
+
+    /// 白名单内是否存在「对该模型可用」的账号（issue #206）：
+    /// 在 has_selectable_in 基础上附加账号×模型冷却谓词——上游 429 为模型维度
+    /// 限流，账号级 until 已不再钉死，pool_health 须按 (uid, model) 判定
+    pub fn has_selectable_matching(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        skip_credit_filters: bool,
+        model_filter: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let tried = HashSet::new();
+        let reserve = self.reserve_credits();
+        entries.values().any(|e| {
+            selectable(e, &tried, now, reserve, skip_credit_filters)
+                && allowed.map_or(true, |a| a.contains(&e.uid))
+                && model_filter(&e.uid)
+        })
     }
 
     /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
@@ -3389,4 +3459,79 @@ mod tests {
     }
 
 
+    #[test]
+    fn config_fingerprint_stable_and_sensitive() {
+        // 一致性巡检指纹：同配置稳定；积分波动不敏感；enabled/策略变化敏感
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0)]);
+        let fp1 = pool.config_fingerprint();
+        assert_eq!(pool.config_fingerprint(), fp1, "同配置指纹应稳定");
+        // 积分波动不改变指纹（防余额回写误触发整池重载）
+        let mut snap = HashMap::new();
+        snap.insert("u1".to_string(), (3.0, None));
+        pool.update_credits_snapshot(&snap);
+        assert_eq!(pool.config_fingerprint(), fp1, "积分波动不应改变指纹");
+        // enabled 变化改变指纹（巡检发现的「禁用不一致」可被捕获）。
+        // macos_main：指纹纳入的是 config_disabled（配置禁用位，PR #187 审查修复——
+        // 运行期 disabled 位不纳入防永久漂移循环），测试须改配置位
+        {
+            let mut entries = safe_lock(&pool.entries);
+            entries.get_mut("u2").unwrap().config_disabled = true;
+        }
+        let fp2 = pool.config_fingerprint();
+        assert_ne!(fp2, fp1, "enabled 变化应改变指纹");
+        // macos_main（PR #187 审查决议）：策略为纯运行态调度偏好，不纳入指纹
+        //（与 DB 侧 wb_pool_fingerprint 口径对齐），变化不得触发巡检热重载
+        pool.set_strategy(PoolStrategy::P2C);
+        assert_eq!(pool.config_fingerprint(), fp2, "策略变化不应改变指纹");
+    }
+
+    // ==================== 账号×模型冷却谓词（issue #206） ====================
+
+    #[test]
+    fn pick_matching_filters_by_model_predicate() {
+        // issue #206：模型谓词过滤——u1 对某模型冷却中被跳过，u2 照常取号；
+        // 恒真谓词下行为与既有 pick 完全一致；谓词也作用于专一绑定账号
+        let pool = build_pool(&[("u1", 10.0, 0), ("u2", 10.0, 0)]);
+        pool.set_strategy(PoolStrategy::FairRotation);
+
+        // 谓词排除 u1 → 只能取到 u2
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(), None, None, false,
+                &|uid| uid != "u1",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u2", "谓词冷却账号应被跳过");
+        // 反向谓词排除 u2 → 只能取到 u1
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(), None, None, false,
+                &|uid| uid != "u2",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u1");
+
+        // 专一绑定：绑定账号被谓词排除 → 不锁定绑定账号，但池内仍有 u2 可用
+        //（让位走正常调度，这正是 issue #206 期望的降级语义）
+        let picked = pool
+            .pick_excluding_constrained_ev_matching(
+                &HashSet::new(), None, Some("u1"), false,
+                &|uid| uid != "u1",
+            )
+            .unwrap();
+        assert_eq!(picked.0.uid, "u2", "绑定账号冷却中应让位给其他可用账号");
+        // 全部账号被谓词排除 → None
+        assert!(
+            pool.pick_excluding_constrained_ev_matching(
+                &HashSet::new(), None, Some("u1"), false,
+                &|_| false,
+            )
+            .is_none(),
+            "全池被谓词排除应返回 None"
+        );
+
+        // has_selectable_matching 同口径：排除全部 → false；排除部分 → true
+        assert!(!pool.has_selectable_matching(None, false, &|_| false));
+        assert!(pool.has_selectable_matching(None, false, &|uid| uid != "u1"));
+    }
 }

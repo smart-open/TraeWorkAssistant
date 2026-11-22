@@ -9,6 +9,15 @@ import { ICON_CHOICES, resolveAppIcon, DEFAULT_APP_ICONS } from '../lib/appIcons
 import { getOrderedApps } from '../lib/appVisibility';
 import { cn } from '../lib/cn';
 import type { AppKey, Settings as SettingsType } from '../types';
+import { listen } from '@tauri-apps/api/event';
+
+/** 通知渠道 kv key → 面板展示名（最近推送回显用，issue #222） */
+const NOTIFY_CHANNEL_LABELS: Record<string, string> = {
+  bark: 'Bark',
+  wechat: 'Webhook',
+  serverchan: 'Server酱',
+  pushplus: 'PushPlus',
+};
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -29,6 +38,24 @@ export default function GeneralSettingsPanel() {
   const [autostartBusy, setAutostartBusy] = useState(false);
   // 通知渠道「发送测试」执行态
   const [testing, setTesting] = useState(false);
+  // 渠道最近一次推送结果（issue #222）：打开面板时加载，测试后刷新回显；
+  // 面板打开期间的真实推送经 notify-result-updated 事件实时刷新（审查修复 #6）
+  const [lastNotifyResult, setLastNotifyResult] = useState<
+    Record<string, { ts: number; ok: boolean; err?: string; src?: string }>
+  >({});
+  const loadLastNotifyResult = () => {
+    api.misc
+      .notifyLastResult()
+      .then(setLastNotifyResult)
+      .catch(() => {});
+  };
+  useEffect(loadLastNotifyResult, []);
+  useEffect(() => {
+    const un = listen('notify-result-updated', () => loadLastNotifyResult());
+    return () => {
+      void un.then((fn) => fn());
+    };
+  }, []);
   // 应用图标选择器：当前展开替换哪个应用的图标（null = 全部收起）
   const [iconPickerFor, setIconPickerFor] = useState<AppKey | null>(null);
   // 侧边栏显示拖拽排序态：dragKey = 正在拖拽的行（半透明反馈）；listRef = 列表容器
@@ -50,6 +77,7 @@ export default function GeneralSettingsPanel() {
       toast('error', String(e));
     } finally {
       setTesting(false);
+      loadLastNotifyResult();
     }
   };
 
@@ -567,8 +595,8 @@ export default function GeneralSettingsPanel() {
           </button>
         </div>
         <p className="mb-3 text-xs text-slate-400">
-          签到完成 / 调度任务失败时推送到手机（Bark / Server酱 / PushPlus）或自建 Webhook，对全部应用（Trae、WorkBuddy、Qoder、豆包、Buddy 国际版）共用，
-          未配置的渠道自动跳过；修改后点底部「保存设置」生效。
+          签到完成 / 调度任务失败 / 定时任务完成（默认关，仅签到/成长类奖励任务，快照/续期/同步类高频任务不推；注意 Server酱 免费档每日仅 5 条）时推送到手机（Bark / Server酱 / PushPlus）或自建
+          Webhook，对全部应用（Trae、WorkBuddy、Qoder、豆包、Buddy 国际版）共用，未配置的渠道自动跳过；修改后点底部「保存设置」生效。
         </p>
         {/* 事件开关组：横排一条，与下方渠道输入视觉分离 */}
         <div className="mb-3 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-sm dark:border-zinc-700/50 dark:bg-zinc-800/30">
@@ -595,6 +623,17 @@ export default function GeneralSettingsPanel() {
               onChange={(e) => update('notify_on_task_fail', e.target.checked)}
             />
             调度任务失败时通知
+          </label>
+          <label
+            className="flex items-center gap-2"
+            title="签到/成长类奖励任务成功完成时推送（快照/续期/目录同步类高频任务不推，避免刷屏并保护渠道额度）；Server酱 免费档每日仅 5 条"
+          >
+            <input
+              type="checkbox"
+              checked={form.notify_on_task_success}
+              onChange={(e) => update('notify_on_task_success', e.target.checked)}
+            />
+            定时任务完成时通知
           </label>
         </div>
         <div className="grid gap-x-4 gap-y-3 text-sm sm:grid-cols-2">
@@ -680,6 +719,36 @@ export default function GeneralSettingsPanel() {
             />
           </div>
         </div>
+        {/* 最近推送状态（issue #222）：渠道失败此前只静默落 app.log，面板直接回显成败与原因。
+            仅展示当前仍配置的渠道（审查修复 #3：清空渠道后的陈旧条目不再误导）；「测试」
+            标记区分来源（审查修复 #7，src="test" 由 notify_test 写入） */}
+        {Object.keys(lastNotifyResult).length > 0 && (
+          <div className="mt-3 rounded-lg border border-slate-200/70 bg-slate-50/60 px-3.5 py-2.5 text-xs dark:border-zinc-700/50 dark:bg-zinc-800/30">
+            <div className="mb-1 font-medium text-slate-500 dark:text-zinc-400">最近推送</div>
+            <div className="space-y-1">
+              {Object.entries(lastNotifyResult)
+                .filter(([k]) => {
+                  const configured: Record<string, boolean> = {
+                    bark: Boolean(form.notify_bark_url?.trim()),
+                    wechat: Boolean(form.notify_webhook_url?.trim()),
+                    serverchan: Boolean(form.notify_serverchan_sendkey?.trim()),
+                    pushplus: Boolean(form.notify_pushplus_token?.trim()),
+                  };
+                  return configured[k];
+                })
+                .map(([k, v]) => (
+                  <div key={k} className="flex flex-wrap items-baseline gap-x-2">
+                    <span className={v.ok ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
+                      {NOTIFY_CHANNEL_LABELS[k] ?? k}
+                      {v.src === 'test' ? '（测试）' : ''} · {v.ok ? '成功' : '失败'}
+                    </span>
+                    <span className="text-slate-400 dark:text-zinc-500">{new Date(v.ts).toLocaleString()}</span>
+                    {!v.ok && v.err && <span className="text-slate-400 dark:text-zinc-500">{v.err}</span>}
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* 代理相关 */}

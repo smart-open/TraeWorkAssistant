@@ -486,7 +486,9 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(),
 
 /// billing/签到/刷新链路桌面端 UA 伪装：必须带版本号——裸 "WorkBuddy" 在
 /// 个人中心「请求明细」的客户端列识别为 "-"（issue #48 反馈的可检测特征）。
-pub const WB_DESKTOP_UA: &str = "WorkBuddy/5.5.6";
+/// 版本对齐当前真实桌面客户端（wb_upstream pe_version 实测 5.8.4）：
+/// 旧值 5.5.6 已是淘汰版本，与在网客户端主流版本偏离本身是弱风控特征（P4）。
+pub const WB_DESKTOP_UA: &str = "WorkBuddy/5.8.4";
 
 /// 账号级稳定设备指纹：sha256("wb-fingerprint:{kind}:{uid}") 前 16 字节 →
 /// 32 位小写十六进制。同账号恒定（虚拟设备稳定）、跨账号隔离（防关联）；
@@ -908,6 +910,16 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
         fs_utils::app_log(
             &state.data_dir,
             &format!("wb: 账号 {acct_id} 已标记需重新登录（{reason}）"),
+        );
+        // issue #220 P3：状态跃迁主动告警（AccountState 事件；同账号同事件 24h
+        // 冷却防重——刷新重试每轮都置位也不会刷屏）。经全局句柄弹桌面通知 + 渠道
+        crate::notify::notify_account_state(
+            crate::notify::global_app(),
+            &state.data_dir,
+            acct_id,
+            "needs_relogin",
+            "WorkBuddy 账号需重新登录",
+            &format!("账号 {acct_id}：{reason}。请重新扫码登录，签到与网关取号已跳过该账号"),
         );
     }
 }

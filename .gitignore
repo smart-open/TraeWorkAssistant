@@ -4,6 +4,8 @@ node_modules/
 src-tauri/target/
 src-tauri/target-testrun/
 src-tauri/gen/
+# libsodium-sys 构建期自动下载的依赖缓存（zip+签名，可随时重新生成）
+.cargo-dist/
 
 # Logs
 *.log

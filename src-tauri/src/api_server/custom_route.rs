@@ -265,7 +265,8 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })?;
     let lines = wb_upstream::lines_with_first_byte_timeout(reader)
         .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
-    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()), None);
+    let (resp, error_info, _eof_truncated) =
+        wb_sse::aggregate(lines, &format!("probe-{}", now_ts()), None);
     match (resp, error_info) {
         (Some(r), None) => {
             let content = r
@@ -678,7 +679,8 @@ pub async fn custom_aggregate_chat(
                     continue;
                 }
             };
-            let (resp, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
+            let (resp, error_info, _eof_truncated) =
+                wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()), None);
             // P2-2：读错误槽合并——掐断丢弃部分响应，换组内下一上游。空完成
             // 哨兵同样覆盖（审查修复，与 wb_route::aggregate_with_transport_cut
             // 同口径：零内容掐断不得计入空完成指纹，否则轮换耗尽可误判

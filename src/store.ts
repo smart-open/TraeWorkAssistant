@@ -225,6 +225,8 @@ function defaultSettings(): Settings {
     doubao_checkin_hhmm: '09:15',
     // 豆包 probe 自动保活（方案 A，默认开）：签到前 probe 缺失/过期自动抓包对齐
     doubao_probe_auto_keepalive: true,
+    // 保活单账号等待抓包秒数（null = 默认 75；后端读取侧 clamp 1..=600）
+    doubao_probe_keepalive_wait_secs: null,
     doubao_sync_mode: 'every_hours',
     doubao_sync_hours: '2',
     doubao_sync_hhmm: '23:50',
@@ -271,6 +273,8 @@ function defaultSettings(): Settings {
     notify_enabled: true,
     notify_on_checkin: true,
     notify_on_task_fail: true,
+    // 定时任务完成推送（issue #222）：默认关，成功推送易耗尽 Server酱免费档每日 5 条
+    notify_on_task_success: false,
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
@@ -774,33 +778,53 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
       const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
-      // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：与真实
-      // 失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
-      const empty = Math.max(0, num(ev.failed_empty_campaigns));
+      // skipped_empty_campaigns（无签到任务，2026-11-21 起 skip 非失败）：确定性
+      // 跳过单列计数，不计入 failed；人工「开始签到」轮次 >0 时页面弹框提示官网
+      //（口径对齐 Rust 侧 run_checkin_round）。旧字段 failed_empty_campaigns 兜底：
+      // 前端热更早于 Rust 重编译的过渡期，旧后端 done 仍带旧字段名，不兜底会误读 0
+      const empty = Math.max(0, num(ev.skipped_empty_campaigns) || num(ev.failed_empty_campaigns));
       // failed_blocked（风控信任未建立 BLOCKED，issue #190）恢复需用户操作
       // （切换账号 + 客户端建信任），单列提示操作路径，不混入可重试失败
       const blocked = Math.max(0, num(ev.failed_blocked));
-      const failed = num(ev.failed);
+      // skipped_ineligible（体验版未满足活动资格，issue #223）为确定性跳过：
+      // 中性提示，不计失败、不抬升级别
+      const ineligible = Math.max(0, num(ev.skipped_ineligible));
+      // failed 数组兜底（P3-14 审查修复）：旧后端过渡期 failed 可能为数组且含
+      // 'empty' 项（空口径未从 failed 拆出），typeof number 判定直接落 0 →
+      // 后续 retryable = failed - permanent - blocked 算术全塌；归一为数组时
+      // 过滤 empty/ineligible 后取长度，与 Rust 侧新口径对齐
+      const failedRaw: unknown = ev.failed;
+      const failed =
+        typeof failedRaw === 'number'
+          ? Math.max(0, failedRaw)
+          : Array.isArray(failedRaw)
+            ? failedRaw.filter((x) => x !== 'empty' && x !== 'ineligible').length
+            : 0;
       const done: QoderCheckinDone = {
         ok: num(ev.ok),
         already: num(ev.already),
         failed,
         empty,
         blocked,
+        skipped_ineligible: ineligible,
       };
       set((s) => ({
         qoderCheckin: { ...s.qoderCheckin, running: false, done, doneRev: s.qoderCheckin.doneRev + 1 },
       }));
       // 审查 Low：消费后端 failed_permanent（凭证终态失败，重试注定无效）——
-      // 可重试数 = failed - empty - permanent（口径对齐调度器 retryable 判定），
+      // 可重试数 = failed - permanent - blocked（口径对齐调度器 retryable 判定；
+      // empty 已归 skip 不在 failed 内，不参与扣减），
       // 文案明示其中哪些需重新登录/更新 PAT，防用户对终态失败反复手点重试；
       // 级别：含终态失败同样 warn（需要用户行动，不降级 success）
-      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - empty - blocked));
-      const retryable = failed - empty - permanent - blocked;
+      const permanent = Math.max(0, Math.min(num(ev.failed_permanent), failed - blocked));
+      const retryable = failed - permanent - blocked;
       get().pushToast(
         retryable > 0 || permanent > 0 || blocked > 0 ? 'warn' : 'success',
         `Qoder 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}` +
-          (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : '') +
+          (empty > 0 ? `（另有 ${empty} 项无签到任务，已跳过）` : '') +
+          (ineligible > 0
+            ? `（另有 ${ineligible} 个体验版账号未满足活动资格，开通试用/订阅/会员卡后可领取）`
+            : '') +
           (blocked > 0
             ? `（其中 ${blocked} 项被风控拦截：请切换到该账号并打开 Qoder 客户端使用一次建立信任，再手动重试（信任生效可能有延迟）；若重试仍拦截，在客户端内重新登录该账号正常使用后，用「扫描本地账号」重新添加）`
             : '') +
@@ -831,6 +855,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           status: (ev.status as QoderCheckinLine['status']) ?? 'fail',
           message: ev.message != null ? String(ev.message) : undefined,
           reward,
+          // P3-16 审查修复：透传后端结构化 fail_kind（skip 分类消费，见 QoderCheckin skipKindOf）
+          fail_kind: ev.fail_kind != null ? String(ev.fail_kind) : undefined,
         };
         return { qoderCheckin: { ...s.qoderCheckin, lines } };
       });

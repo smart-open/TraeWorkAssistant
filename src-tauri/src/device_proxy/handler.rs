@@ -869,8 +869,10 @@ fn try_capture_doubao_campaign(
     );
     ctx.log.log(&format!("  {line}"));
     crate::fs_utils::app_log(&ctx.data_dir, &line);
-    // 完整参数 + msToken 入 vault（仅 landing/checkin 与 v3/detail 两类目标端点；
-    // 任何一次命中都刷新——参数是设备指纹非一次性值，msToken 取最新）。
+    // 完整参数 + msToken 入 vault（目标端点：landing/checkin、item/reward/claim 与
+    // v3/detail 三类；任何一次命中都刷新——参数是设备指纹非一次性值，msToken 取最新）。
+    // 2026-11-17：claim 端点加入白名单（修复①配套，客户端真实提交形态入库对齐）；
+    // landing/checkin 保留——客户端手动签到仍走旧端点，捕获链路兜底落库依赖它。
     // 审查修复（2026-10-28）：仅当上游信封 code==0 才落库——客户端自己被风控拒绝的
     // 请求参数不得覆盖可用参数集（响应体非 JSON/解析失败也视为不可信，跳过）
     let resp_ok = status == 200
@@ -881,7 +883,11 @@ fn try_capture_doubao_campaign(
                     .unwrap_or(false)
             })
             .unwrap_or(false);
-    if resp_ok && (p.ends_with("/landing/checkin") || p.contains("/v3/detail/")) {
+    if resp_ok
+        && (p.ends_with("/landing/checkin")
+            || p.contains("/item/reward/claim/")
+            || p.contains("/v3/detail/"))
+    {
         if !params.is_empty() {
             // 设备级 Cookie（2026-11-06）：字节风控的设备标识，发奖端点 landing/checkin
             // 强校验——仅 sessionid+sid_guard+msToken 三个会话 Cookie 会被 710010702 拒。
@@ -920,7 +926,13 @@ fn try_capture_doubao_campaign(
         // 原本只有 CLI 签到落库，客户端手动签到的 reward 看不见。此处解析 checkin
         // code==0 响应的 reward_amount，按 cookie sessionid 逐账号比对 vault 明文凭证
         // 定位归属账号后 record_day_at（fail-不覆盖-success 规则见 record_day）。
-        if p.ends_with("/landing/checkin") {
+        // 2026-11-17：新 claim 端点（item/reward/claim）同样接入——客户端领取路径
+        // 升级后走新端点，落库链路必须双端点覆盖（resp_ok 仅校验信封 code==0，「确认中」
+        // 回执 biz_error.code=3 信封同为 0 可通过；真正防线是下方 `checked || idempotent`
+        // 白名单——确认中回执两者皆 false，不会误落 success）
+        let is_checkin_submit =
+            p.ends_with("/landing/checkin") || p.contains("/item/reward/claim/");
+        if is_checkin_submit {
             let parsed = serde_json::from_slice::<serde_json::Value>(&resp_plain[..resp_plain.len().min(65536)])
                 .ok()
                 .and_then(|v| v.get("data").cloned());

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { daysFromDoubaoDetail } from './checkinCalendarDoubao';
 import {
   canShiftMonth,
   dayDotToneClass,
@@ -250,5 +251,54 @@ describe('daysFromQoderRecords（Qoder 双活动记录 → 逐日聚合）', () 
     expect(days[0].dots).toEqual([]);
     expect(dayDotToneClass(days[0].ok, days[0].fail)).toBe('bg-emerald-500');
     expect(days[0].entries[0].status).toBe('already');
+  });
+
+  it('skip（体验版未满足资格，issue #223）：不入 ok/fail 计数，明细中性展示且 note 保留原因', () => {
+    const days = daysFromQoderRecords([
+      {
+        date: '2026-10-01', user_id: 'u1', name: 'A', status: 'skip',
+        message: '体验版账号不参与每日 100 Credits 活动（开通试用/订阅/会员卡后可领取）',
+      },
+      {
+        date: '2026-10-01', user_id: 'u2', name: 'B', status: 'success', reward: 100,
+        campaigns: [{ id: 'c1', name: '每日签到', kind: 'success' }],
+      },
+    ]);
+    // 混合日：skip 不计失败，成功照常计数；skip 行中性灰标 + 原因进 note
+    expect(days[0]).toMatchObject({ ok: 1, fail: 0 });
+    expect(days[0].entries[0].status).toBe('skip');
+    expect(days[0].entries[0].note).toContain('体验版账号不参与');
+    const [onlySkip] = daysFromQoderRecords([
+      { date: '2026-10-02', user_id: 'u1', name: 'A', status: 'skip' },
+    ]);
+    // 纯 skip 日：ok/fail 均为 0 → 灰点（非红非绿）
+    expect(onlySkip).toMatchObject({ ok: 0, fail: 0 });
+    expect(dayDotToneClass(onlySkip.ok, onlySkip.fail)).toBe('bg-slate-300 dark:bg-zinc-600');
+  });
+});
+
+describe('daysFromDoubaoDetail（豆包档期日历）', () => {
+  it('skip 不计 ok/fail：中性灰点 + 原因进 note；success 计 ok 且奖励合计（审查修复）', () => {
+    const days = daysFromDoubaoDetail([
+      {
+        date: '2026-10-01',
+        accounts: [
+          { user_id: 'u1', name: 'A', status: 'skip', message: '未投放签到活动', reward: null },
+          { user_id: 'u2', name: 'B', status: 'success', reward: 10 },
+          { user_id: 'u3', name: 'C', status: 'fail', message: '风控 710010702', reward: null },
+        ],
+      },
+    ]);
+    // skip 不落入 ok（此前绿点「已领」误导）也不落入 fail
+    expect(days[0]).toMatchObject({ ok: 1, fail: 1, reward: 10 });
+    expect(days[0].entries[0]).toMatchObject({ name: 'A', status: 'skip', note: '未投放签到活动' });
+    expect(days[0].entries[1]).toMatchObject({ name: 'B', status: 'success', note: '+10 额度' });
+    expect(days[0].entries[2]).toMatchObject({ name: 'C', status: 'fail', note: '风控 710010702' });
+    // 纯 skip 日 → 灰点
+    const [onlySkip] = daysFromDoubaoDetail([
+      { date: '2026-10-02', accounts: [{ user_id: 'u1', name: 'A', status: 'skip', reward: null }] },
+    ]);
+    expect(onlySkip).toMatchObject({ ok: 0, fail: 0 });
+    expect(dayDotToneClass(0, 0)).toBe('bg-slate-300 dark:bg-zinc-600');
   });
 });

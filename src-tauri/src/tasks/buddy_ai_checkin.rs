@@ -1153,15 +1153,17 @@ pub fn run_checkin_round(
     runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     emit: &mut dyn FnMut(&Value),
 ) -> Value {
-    let agent = crate::tasks::http_agent(30);
-    // 花名册经 buddy_ai.rs 公开 helper（WbPool 字段不对 tasks 暴露）；
+    // 花名册经 buddy_ai.rs 公开 helper
     // 仅含凭证账号参与（无凭证跳过——手工导入无 rt 也打不了卡）
     let store = crate::tasks::wb_common::buddy_ai_token_store_load(&state.data_dir);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let roster = crate::commands::workbuddy::buddy_pool_roster(state);
-    let accounts: Vec<(String, String, String)> = roster
+    // P3-11 审查修复：roster 四元组携带 proxy_url——按账号独立出口代理（口径对齐
+    // wb_checkin::run_round；同账号 wb 签到已走 proxy 而 buddy-ai 打卡直连，出口
+    // 不一致本身是风控画像信号）。None/空 = 直连
+    let accounts: Vec<(String, String, String, Option<String>)> = roster
         .into_iter()
-        .filter(|(id, _, _)| {
+        .filter(|(id, _, _, _)| {
             tokens
                 .get(id)
                 .and_then(|r| r.get("access_token"))
@@ -1193,7 +1195,7 @@ pub fn run_checkin_round(
         g.as_ref().map(|rt| rt.shared.clone())
     });
     let mut events: Vec<Value> = Vec::new();
-    for (i, (id, name, pool_uid)) in accounts.iter().enumerate() {
+    for (i, (id, name, pool_uid, proxy_url)) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
@@ -1213,6 +1215,8 @@ pub fn run_checkin_round(
             Some(d) if d.contains(".workbuddy.ai") => crate::tasks::wb_common::region_activity_base(d),
             _ => crate::tasks::wb_common::BILLING_BASE_GLOBAL,
         };
+        // P3-11 审查修复：按账号 proxy_url 独立出口（None/空回落默认直连 agent）
+        let acct_agent = crate::tasks::http_agent_with_proxy(30, proxy_url.as_deref());
         // 开跑即报（长静默修复）：此前逐账号事件仅在处理完成后发出，
         // 多分钟的六步链期间前端零反馈，用户感知为「点了没反应」
         emit(&json!({
@@ -1220,7 +1224,7 @@ pub fn run_checkin_round(
             "name": name,
             "message": format!("开始处理（{}/{}），六步链预计 1-3 分钟…", i + 1, accounts.len()),
         }));
-        let mut ev = process_account(state, &agent, id, name, &token, &uid, base, shared.as_ref(), &mut *emit);
+        let mut ev = process_account(state, &acct_agent, id, name, &token, &uid, base, shared.as_ref(), &mut *emit);
         ev["index"] = json!(i + 1);
         emit(&ev);
         events.push(ev);

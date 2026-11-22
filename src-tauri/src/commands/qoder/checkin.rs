@@ -299,21 +299,22 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
             "Qoder 启动补签跳过：另一进程正在执行签到（跨进程锁占用）".to_string()
         } else {
             format!(
-                "Qoder 启动补签完成: 成功 {}，已签 {}，失败 {}",
+                "Qoder 启动补签完成: 成功 {}，已签 {}，失败 {}，跳过 {}",
                 done["ok"].as_i64().unwrap_or(0),
                 done["already"].as_i64().unwrap_or(0),
                 done["failed"].as_i64().unwrap_or(0),
+                done["skipped_ineligible"].as_i64().unwrap_or(0)
+                    + done["skipped_empty_campaigns"].as_i64().unwrap_or(0),
             )
         };
         fs_utils::app_log(&state2.data_dir, &msg);
         let failed = done["failed"].as_i64().unwrap_or(0);
-        // empty_campaigns（活动未开始/不可用）非用户可操作失败：重试也无解，仅记日志
-        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）。
+        // 无签到任务（empty_campaigns）与未满足资格（issue #223）均归类 skip、
+        // 不计入 failed（2026-11-21 口径升级）：静默补签直接跳过，不推送打扰。
         // failed_blocked（issue #190 风控信任未建立）仍计入推送——它是用户可操作失败
         // （切换账号 + 客户端建信任后可恢复），不推送会静默滞留（审查 Q2 修复）
         let failed_blocked = done["failed_blocked"].as_i64().unwrap_or(0);
-        let failed_actionable =
-            failed - done["failed_empty_campaigns"].as_i64().unwrap_or(0);
+        let failed_actionable = failed;
         if failed_actionable > 0 {
             let mut text = format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看");
             if failed_blocked > 0 {

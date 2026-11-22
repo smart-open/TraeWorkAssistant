@@ -2108,6 +2108,9 @@ mod tests {
             "broken pipe (os error 32)",
             "connection closed before message completed",
             "h2 error: protocol violation",
+            // issue #212：Windows 中文 locale 连接重置文案（502 报文与长流掐断同源）
+            "远程主机强迫关闭了一个现有的连接。 (os error 10054)",
+            "os error 10054",
         ];
         for s in hits {
             assert!(crate::api_server::is_transport_cut_text(s), "应命中: {s}");
@@ -2117,6 +2120,9 @@ mod tests {
             "weird os error 42",
             "upstream 500: internal server error",
             "stream completed normally",
+            // 干扰反例：相近数字/短语不得命中
+            "os error 1005",
+            "远程主机主动断开",
         ];
         for s in misses {
             assert!(!crate::api_server::is_transport_cut_text(s), "不应命中: {s}");

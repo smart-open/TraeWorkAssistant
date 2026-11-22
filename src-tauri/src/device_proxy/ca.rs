@@ -272,10 +272,13 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("ca.crt base64 解码失败: {e}"))
 }
 
-/// rustls CryptoProvider：tokio-rustls 默认启用 aws-lc-rs，全进程共享单例
+/// rustls CryptoProvider：全进程共享单例。issue #224：原用 aws_lc_rs（C 代码，
+/// 内部错误直接 abort → 0xc0000409/0x7 无声崩溃且 catch_unwind 拦不住），收敛为
+/// ring（纯 Rust，异常路径可观测可 unwind）；rcgen 的 KeyPair（CA 签发）不走
+/// rustls provider，仍由 aws_lc_rs 承担，不受影响
 fn load_crypto_provider() -> CryptoProvider {
-    // install_default 幂等：已被 tungstenite/其他模块安装过则忽略
-    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+    // install_default 幂等：已被 main.rs 启动链/其他模块安装过则忽略
+    let provider = tokio_rustls::rustls::crypto::ring::default_provider();
     let _ = provider.clone().install_default();
     provider
 }

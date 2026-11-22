@@ -63,6 +63,22 @@ jobs:
           cp release/*_x64_portable.zip release/windows/
           cp release/latest.json release/windows/
 
+      # issue #224：保留 release PDB 供崩溃偏移符号化（0xc0000409 类 abort 的
+      # 异常偏移仅凭 exe 无法定位，需同版本 PDB；独立 artifact，缺 PDB 不阻断主产物）
+      - name: Stage debug symbols (PDB)
+        shell: bash
+        run: |
+          mkdir -p release/symbols
+          # 显式区分「无 PDB」（良性，不阻断）与「复制失败」（须红）——原
+          # `cp ... || echo` 会把多 PDB 部分复制的非零退出码一并吞掉
+          shopt -s nullglob
+          pdbs=(src-tauri/target/release/*.pdb)
+          if [ ${#pdbs[@]} -eq 0 ]; then
+            echo "WARN: no PDB produced"
+          else
+            cp "${pdbs[@]}" release/symbols/ || exit 1
+          fi
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -72,3 +88,10 @@ jobs:
           path: |
             release/windows/*
           if-no-files-found: error
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-work-assistant-windows-symbols
+          path: release/symbols/
+          if-no-files-found: warn

@@ -2116,15 +2116,28 @@ pub fn doubao_checkin_results_save(
 
 /// 读回 {results: [...]}（按 id 升序 = 原追加序）
 pub fn wb_checkin_results_load(s: &Store) -> Value {
+    wb_checkin_results_rows(s).map_or(json!({ "results": [] }), |rows| json!({ "results": rows }))
+}
+
+/// 读回结果行（失败透传 None）：调用方需区分「空表」与「读失败」——写路径若把
+/// 读失败当空表继续 save，会以残缺视图清库覆盖（P2 审查修复，对齐
+/// doubao_checkin_results_try_load 口径）
+pub fn wb_checkin_results_try_load(s: &Store) -> Option<Value> {
+    wb_checkin_results_rows(s).map(|rows| json!({ "results": rows }))
+}
+
+/// 结果行读取本体（成功 Some(rows)，失败 None）
+fn wb_checkin_results_rows(s: &Store) -> Option<Vec<Value>> {
     let rows = s
         .with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT date, time, user_id, name, status, message, reward FROM wb_checkin_results ORDER BY id",
+                "SELECT date, time, user_id, name, status, message, reward, reward_pending, pre_balance, pre_wb_credits FROM wb_checkin_results ORDER BY id",
             )?;
             let rows = stmt
                 .query_map([], |r| {
                     let reward: Option<f64> = r.get(6)?;
-                    Ok(json!({
+                    let pending: Option<i64> = r.get(7)?;
+                    let mut o = json!({
                         "date": r.get::<_, String>(0)?,
                         "time": r.get::<_, String>(1)?,
                         "user_id": r.get::<_, String>(2)?,
@@ -2132,13 +2145,25 @@ pub fn wb_checkin_results_load(s: &Store) -> Value {
                         "status": r.get::<_, String>(4)?,
                         "message": r.get::<_, String>(5)?,
                         "reward": reward,
-                    }))
+                    });
+                    // issue #180：pending 标记 + 签到前余额基准仅在有值时携带
+                    //（存量行/无 pending 行保持原 7 字段形态，回填检索按 ==true 判定）
+                    if pending == Some(1) {
+                        o["reward_pending"] = json!(true);
+                        for (k, i) in [("pre_balance", 8usize), ("pre_wb_credits", 9)] {
+                            let v: Option<f64> = r.get(i)?;
+                            if let Some(f) = v {
+                                o[k] = json!(f);
+                            }
+                        }
+                    }
+                    Ok(o)
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
-        .unwrap_or_default();
-    json!({ "results": rows })
+        .ok()?;
+    Some(rows)
 }
 
 /// 整表替换（原「读改写 results 数组 + 90 天裁剪」的落库等价物，裁剪仍由调用方计算）
@@ -2149,10 +2174,21 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
         c.execute_batch("BEGIN; DELETE FROM wb_checkin_results;")?;
         {
             let mut stmt = c.prepare(
-                "INSERT INTO wb_checkin_results(date, time, user_id, name, status, message, reward) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO wb_checkin_results(date, time, user_id, name, status, message, reward, reward_pending, pre_balance, pre_wb_credits) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for r in arr {
                 let reward = r.get("reward").and_then(Value::as_f64);
+                // issue #180：pending 标记 + 签到前余额基准随行落库（此前被 7 列
+                // INSERT 静默丢弃，T+1 差值回填失效）；无 pending 行三值恒 NULL
+                let pending = r.get("reward_pending").and_then(Value::as_bool);
+                let (pre_balance, pre_wb_credits) = if pending == Some(true) {
+                    (
+                        r.get("pre_balance").and_then(Value::as_f64),
+                        r.get("pre_wb_credits").and_then(Value::as_f64),
+                    )
+                } else {
+                    (None, None)
+                };
                 stmt.execute(rusqlite::params![
                     r.get("date").and_then(Value::as_str).unwrap_or(""),
                     r.get("time").and_then(Value::as_str).unwrap_or(""),
@@ -2161,6 +2197,9 @@ pub fn wb_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
                     r.get("status").and_then(Value::as_str).unwrap_or(""),
                     r.get("message").and_then(Value::as_str).unwrap_or(""),
                     reward,
+                    pending.map(|p| p as i64),
+                    pre_balance,
+                    pre_wb_credits,
                 ])?;
             }
         }

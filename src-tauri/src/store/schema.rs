@@ -332,6 +332,13 @@ pub fn init(conn: &Connection) -> Result<(), String> {
     // 豆包签到结果补失败原因列（2026-11-07 可观测性：fail 的 message 落库，切页/重开后
     // 日历明细仍可排障；老库存量行 NULL = 无记录）
     ensure_column(conn, "doubao_checkin_results", "message", "TEXT")?;
+    // issue #180 T+1 差值回填修复（SQLite 迁移遗留）：append_results 写入的
+    // reward_pending/pre_balance/pre_wb_credits 此前被 7 列表静默丢弃——
+    // try_backfill_pending 检索 reward_pending 永不命中，T+1 差值回填自 SQLite 化
+    // 起失效。幂等补列恢复落库通道（老库存量行 NULL = 无 pending，不影响回填判定）
+    ensure_column(conn, "wb_checkin_results", "reward_pending", "INTEGER")?;
+    ensure_column(conn, "wb_checkin_results", "pre_balance", "REAL")?;
+    ensure_column(conn, "wb_checkin_results", "pre_wb_credits", "REAL")?;
     Ok(())
 }
 

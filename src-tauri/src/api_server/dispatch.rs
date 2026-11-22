@@ -1242,7 +1242,11 @@ fn pool_health(
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
-            if !state.wb_pool.has_selectable_in(allowed, false) {
+            // issue #206：账号级 until 不再钉 429——改按账号×模型冷却对判定，
+            // 部分账号 (uid, model) 冷却不影响其他账号可用性
+            if !state.wb_pool.has_selectable_matching(allowed, false, &|uid| {
+                super::wb_route::account_model_cooling_remaining(&view, uid, &model).is_none()
+            }) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -1255,7 +1259,10 @@ fn pool_health(
             if super::wb_route::model_cooling_remaining(&view, &model).is_some() {
                 return Err(FallbackReason::ModelCooldown);
             }
-            if !state.buddy_ai_pool.has_selectable_in(allowed, false) {
+            // issue #206：同构账号×模型冷却判定（独立冷却表）
+            if !state.buddy_ai_pool.has_selectable_matching(allowed, false, &|uid| {
+                super::wb_route::account_model_cooling_remaining(&view, uid, &model).is_none()
+            }) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -1510,6 +1517,8 @@ mod tests {
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             buddy_ai_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            wb_account_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
+            buddy_ai_account_model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
@@ -1544,6 +1553,11 @@ mod tests {
             buddy_ai_enabled: AtomicBool::new(false),
             buddy_ai_sticky_enabled: AtomicBool::new(false),
             buddy_ai_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pseudo_stream: AtomicBool::new(false),
+            buddy_ai_pseudo_stream: AtomicBool::new(false),
+            wb_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            buddy_ai_retry_budget: std::sync::atomic::AtomicU32::new(0),
+            pseudo_keepalive_secs: std::sync::atomic::AtomicU64::new(5),
             custom_upstream_sticky: std::sync::Mutex::new(std::collections::HashMap::new()),
             custom_lb_counters: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -1630,6 +1644,26 @@ mod tests {
                     group_id: String::new(),
                 }],
                 &[if trae { "t1" } else { "b1" }.to_string()],
+            );
+        }
+
+        /// 往 buddy 池额外塞一个健康账号（不覆盖既有条目，测试多账号场景用）
+        fn seed_healthy_extra_wb(&self, uid: &str) {
+            self.state.wb_pool.sync_from_wb(
+                &[super::super::pool::WbSyncAccount {
+                    uid: uid.into(),
+                    name: "acc2".into(),
+                    token: "tk".into(),
+                    domain: "d".into(),
+                    enterprise_id: String::new(),
+                    global_region: false,
+                    credits: Some(10.0),
+                    credits_expire_at: None,
+                    credits_fetched_at: None,
+                    needs_relogin: false,
+                    group_id: String::new(),
+                }],
+                &[uid.to_string()],
             );
         }
 
@@ -3091,6 +3125,58 @@ mod tests {
             "dedicated 指向池应并入约束涉及池列表: {msg2}"
         );
     }
+
+    /// issue #206：账号×模型维度冷却——部分账号对某模型 429 冷却时，
+    /// pool_health 对该模型仍判定健康（其他账号可用），不误报 NoHealthyAccount；
+    /// 全部账号对该模型冷却时才 NoHealthy。账号级 until 不再被 429 钉死
+    #[test]
+    fn t206_pool_health_account_model_cooldown() {
+        let f = fixture(&[], Some(&["kimi", "deepseek"]), None);
+        f.seed_healthy(false); // buddy 池健康账号 b1
+        f.seed_healthy_extra_wb("b2"); // 第二个健康账号（单账号冷却后仍有候选）
+        let view = super::super::wb_route::WbView::wb(f.state.clone());
+        let mk_sources = |m: &str| ModelSources {
+            buddy: Some((m.to_string(), None)),
+            buddy_intl_only: false,
+            buddy_in_both: false,
+            buddy_intl_final: Some(m.to_string()),
+            trae: false,
+            trae_final: (m.to_string(), None, false),
+            qoder: None,
+            custom: Vec::new(),
+        };
+        let sources = mk_sources("kimi");
+
+        // 无冷却：健康
+        assert!(pool_health(&f.state, TargetPool::Buddy, &sources, true, None).is_ok());
+
+        // 单账号对 kimi 429 冷却：仍有其他可用账号 → 健康（核心修复点）
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        super::super::wb_route::note_account_model_cooldown(&view, "b1", "kimi", now + 3600);
+        assert!(
+            pool_health(&f.state, TargetPool::Buddy, &sources, true, None).is_ok(),
+            "单账号×模型冷却不得导致全池 NoHealthy（issue #206）"
+        );
+
+        // 全部账号对 kimi 冷却 → NoHealthyAccount（该模型维度确实无号可用）
+        super::super::wb_route::note_account_model_cooldown(&view, "b1", "kimi", now + 7200);
+        super::super::wb_route::note_account_model_cooldown(&view, "b2", "kimi", now + 7200);
+        assert_eq!(
+            pool_health(&f.state, TargetPool::Buddy, &sources, true, None).unwrap_err(),
+            FallbackReason::NoHealthyAccount
+        );
+
+        // 换模型 deepseek：冷却表按模型隔离 → 健康
+        let sources_ds = mk_sources("deepseek");
+        assert!(
+            pool_health(&f.state, TargetPool::Buddy, &sources_ds, true, None).is_ok(),
+            "kimi 全冷却不得波及 deepseek（issue #206 主诉）"
+        );
+    }
+
 
     /// issue #136 修复2：候选池耗尽/提前终止落逐池归因日志——「白名单把池排除」
     /// （trae=no_healthy_account）与「源剔除」（buddy=switch_off/no_source）一行可辨；

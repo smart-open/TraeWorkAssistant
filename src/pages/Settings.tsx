@@ -339,24 +339,13 @@ export default function Settings() {
             </label>
           </h3>
           <p className="mb-3 text-xs text-slate-400">
-            应用运行期间每日到点自动续期临期账号（惰性判定：JWT 剩余 &le;48h 或 refresh_token 临期才真正刷新，
-            减少与 TRAE IDE 的双端互踢）。无 refresh_token 的账号自动跳过；刷新失败 30 分钟后自动重试。
+            应用运行期间每 6 小时自动检查续期临期账号（issue #201：加密调度提升瞬态失败自愈能力；
+            惰性判定：JWT 剩余 &le;48h 或 refresh_token 临期才真正刷新，减少与 TRAE IDE 的双端互踢）。
+            无 refresh_token 的账号自动跳过；刷新失败 30 分钟后自动重试。
           </p>
           <div className="flex items-center gap-2">
-            <label className="label !mb-0">每日触发时刻</label>
-            <div className="relative flex items-center">
-              <Clock size={15} className="pointer-events-none absolute left-2.5 text-slate-400" />
-              <input
-                type="time"
-                value={form.jwt_renew_hhmm}
-                onChange={(e) => update('jwt_renew_hhmm', e.target.value || '09:00')}
-                disabled={!form.jwt_renew_enabled}
-                className="input h-9 !w-32 pl-8 text-sm"
-              />
-            </div>
-            {form.jwt_renew_enabled && (
-              <span className="text-xs text-slate-400">每天 {form.jwt_renew_hhmm || '09:00'} 执行（应用关闭期间不执行）</span>
-            )}
+            <label className="label !mb-0">调度节奏</label>
+            <span className="text-xs text-slate-400">每 6 小时检查一次（是否真正刷新由 JWT 剩余时长自动判定，历史「每日触发时刻」设置已不再生效）</span>
           </div>
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />

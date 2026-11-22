@@ -67,6 +67,9 @@ export default function DoubaoSettings() {
   // probe 自动保活开关（main 2026-11-06，方案 A，默认开）：签到前 probe 缺失/过期时自动
   // 开代理 + 切客户端抓包对齐（710010702 设备指纹缺失的自愈链）
   const [probeAutoKeepalive, setProbeAutoKeepalive] = useState(true);
+  // probe 保活等待窗口秒数（main 3.9.4 审查修复 #3，草稿输入态；落库见 changeProbeKeepaliveWaitSecs）
+  const [probeKeepaliveWaitSecs, setProbeKeepaliveWaitSecs] = useState('');
+
   const toggleIncludeIdb = async (v: boolean) => {
     setIncludeIdb(v);
     try {
@@ -182,6 +185,33 @@ export default function DoubaoSettings() {
     } catch (err) {
       setProbeAutoKeepalive(!v);
       pushToast('error', `保存设置失败：${String(err)}`);
+    }
+  };
+
+  // probe 保活单账号等待抓包秒数（审查修复 2026-11-18 #3）：空/0 = 回退默认 75，
+  // 1-600 落库（后端读取侧另有 clamp 兜底）。校验失败/保存失败回弹已保存值。
+  // 并发序号守卫（对齐 checkinHhmmSeqRef 范式）：失焦连发时仅最后请求可提示
+  // 成功/回滚，避免慢请求迟到覆盖新值
+  const probeKeepaliveSeqRef = useRef(0);
+  const changeProbeKeepaliveWaitSecs = async (v: string) => {
+    setProbeKeepaliveWaitSecs(v);
+    const t = v.trim();
+    const savedText = settings?.doubao_probe_keepalive_wait_secs != null ? String(settings.doubao_probe_keepalive_wait_secs) : '';
+    const n = /^\d+$/.test(t) ? Number.parseInt(t, 10) : NaN;
+    if (t !== '' && t !== '0' && (!Number.isFinite(n) || n < 1 || n > 600)) {
+      pushToast('warn', '等待秒数应为 1-600 的整数，留空或 0 表示默认 75（已保持原值）');
+      setProbeKeepaliveWaitSecs(savedText);
+      return;
+    }
+    const seq = ++probeKeepaliveSeqRef.current;
+    try {
+      await saveSettings({ doubao_probe_keepalive_wait_secs: t === '' || t === '0' ? null : n });
+      if (seq === probeKeepaliveSeqRef.current) pushToast('success', t === '' || t === '0' ? '等待窗口已恢复默认（75 秒）' : `等待窗口已保存（${n} 秒）`);
+    } catch (err) {
+      if (seq === probeKeepaliveSeqRef.current) {
+        setProbeKeepaliveWaitSecs(savedText);
+        pushToast('error', `保存设置失败：${String(err)}`);
+      }
     }
   };
 
@@ -307,6 +337,7 @@ export default function DoubaoSettings() {
       sync_hours: settings?.doubao_sync_hours ?? null,
       sync_hhmm: settings?.doubao_sync_hhmm ?? null,
       checkin_hhmm: settings?.doubao_checkin_hhmm ?? null,
+      probe_wait_secs: settings?.doubao_probe_keepalive_wait_secs != null ? String(settings.doubao_probe_keepalive_wait_secs) : null,
     };
     if (cur.path && cur.path !== prev.path) setPath(cur.path);
     if (cur.renew_url && cur.renew_url !== prev.renew_url) setRenewUrl(cur.renew_url);
@@ -327,6 +358,10 @@ export default function DoubaoSettings() {
         setCheckinHhmmDraft(cur.checkin_hhmm);
         checkinHhmmSavedRef.current = cur.checkin_hhmm;
       }
+      if (cur.probe_wait_secs && cur.probe_wait_secs !== prev.probe_wait_secs) setProbeKeepaliveWaitSecs(cur.probe_wait_secs);
+      // macos_main 合并审查 Low：他端把该值清为 null/0 时同步清空本页草稿——
+      // 只在非空时回填会让输入框残留旧数字，失焦把旧草稿重新落库（「他端清空」复活）
+      else if (!cur.probe_wait_secs && prev.probe_wait_secs) setProbeKeepaliveWaitSecs('');
     }
     prevTextSettingsRef.current = cur;
     // 审查修复（P2）：schtasks 状态查询仅 Windows 发起——mac 上后端恒 Err，
@@ -337,7 +372,7 @@ export default function DoubaoSettings() {
       void refreshCheckinTaskStatus();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm, settings?.doubao_sync_mode, settings?.doubao_sync_hours, settings?.doubao_sync_hhmm, settings?.doubao_probe_auto_keepalive]);
+  }, [settings?.doubao_path, settings?.doubao_renew_url, settings?.doubao_quota_url, settings?.doubao_snapshot_include_idb, settings?.doubao_keepalive_enabled, settings?.doubao_quota_enabled, settings?.doubao_checkin_enabled, settings?.doubao_checkin_hhmm, settings?.doubao_sync_mode, settings?.doubao_sync_hours, settings?.doubao_sync_hhmm, settings?.doubao_probe_auto_keepalive, settings?.doubao_probe_keepalive_wait_secs]);
 
   const detect = async () => {
     setDetecting(true);
@@ -480,9 +515,12 @@ export default function DoubaoSettings() {
       // 返回契约：batch → { ok, total, success, already, failed, reward_total, errors, finished_at }；
       // 后端 run_batch 在 failed>0 时返回 Err（"豆包签到：N 成功 / N 已领 / N 失败：…"），
       // 部分成功走 catch；空池 → { ok, skipped: "无豆包账号", skipped_empty_pool: true }
-      //（奖励型任务豁免，调度器对后者不 mark_run；前端双字段统一判定）
+      //（奖励型任务豁免，调度器对后者不 mark_run；前端双字段统一判定）。
+      // P3-12 审查修复：skipped 双态——字符串=整轮跳过（Busy/空池），数字=批内
+      // 跳过账号计数（部分成功成功轮正常返回）；数字态不得进「签到跳过」分支
       const r = (await api.doubao.checkinRun()) as {
-        skipped?: string;
+        skipped?: string | number;
+        skipped_reason?: string;
         skipped_empty_pool?: boolean;
         total?: number;
         success?: number;
@@ -490,12 +528,21 @@ export default function DoubaoSettings() {
         failed?: number;
         reward_total?: number;
       };
-      if (r.skipped ?? r.skipped_empty_pool) {
-        pushToast('info', `签到跳过：${r.skipped ?? '无豆包账号'}`);
+      // P3-12 审查修复：skipped 双态——字符串=整轮跳过（Busy/空池），数字=批内
+      // 跳过账号计数（部分成功成功轮正常返回）；数字态不得进「签到跳过」分支
+      const wholeRoundSkipped = typeof r.skipped === 'string';
+      if (wholeRoundSkipped || r.skipped_empty_pool) {
+        pushToast(
+          'info',
+          `签到跳过：${r.skipped ?? '无豆包账号'}${r.skipped_reason ? `（${r.skipped_reason}）` : ''}`,
+        );
       } else {
+        const skipCount = typeof r.skipped === 'number' ? r.skipped : 0;
         pushToast(
           'success',
-          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}，新增额度 +${r.reward_total ?? 0}`,
+          `签到完成：共 ${r.total ?? 0} 个账号，成功 ${r.success ?? 0} · 已签 ${r.already ?? 0} · 失败 ${r.failed ?? 0}${
+            skipCount > 0 ? ` · 跳过 ${skipCount}` : ''
+          }，新增额度 +${r.reward_total ?? 0}`,
         );
       }
     } catch (err) {
@@ -958,6 +1005,19 @@ export default function DoubaoSettings() {
               </span>
             </span>
           </label>
+
+          {/* probe 保活等待窗口（审查修复 #3，main 3.9.4）：单账号等待抓包秒数可调 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-slate-500">单账号等待抓包</span>
+            <input
+              value={probeKeepaliveWaitSecs}
+              onChange={(e) => setProbeKeepaliveWaitSecs(e.target.value)}
+              onBlur={(e) => void changeProbeKeepaliveWaitSecs(e.target.value)}
+              placeholder="75"
+              className="input w-20 text-xs"
+            />
+            <span className="text-slate-400">秒（1-600；留空 = 默认 75，手动点签到较慢时可调大）</span>
+          </div>
 
           {/* 手动签到 */}
           <div className="flex flex-wrap items-center gap-2">

@@ -56,9 +56,13 @@ const TASKS: &[SchedTask] = &[
     // Trae 每日签到：默认 09:00，环境配置页可改（settings.trae_checkin_hhmm）；
     // Windows 计划任务（AIWorkAssistant_DailyCheckin）注册时间复用同一设置值
     SchedTask { key: "trae-checkin", name: "Trae 每日签到", hhmm: "09:00", kind: "fix" },
-    // Trae JWT 定时续期（issue #27）：默认 09:00，环境配置页可改（settings.jwt_renew_hhmm）；
-    // 惰性判定（剩余 ≤48h 才真正刷新），每日一次为安全超集
-    SchedTask { key: "trae-renew", name: "Trae JWT 定时续期", hhmm: "09:00", kind: "fix" },
+    // Trae JWT 定时续期（issue #27 → issue #201 P2）：kind "renew" → 每 6 小时
+    //（对齐 qoder-refresh 先例）。原 daily 09:00 仅一次机会，PC 关机错过窗口或
+    // 瞬态失败即整日停摆；48h 惰性窗内 6h 间隔最多 8 次触发，单次瞬态失败可自愈。
+    // 轮换次数不受影响：是否真正刷新仍由 lazy_refresh_needed 门控（每 tick 全量
+    // 判定，未到期即空转）。开关（settings.jwt_renew_enabled）与时刻设置
+    //（jwt_renew_hhmm）保留兼容：开关仍生效；hhmm 不再参与判定（EveryHours 模式）
+    SchedTask { key: "trae-renew", name: "Trae JWT 定时续期", hhmm: "09:00", kind: "renew" },
     SchedTask { key: "wb-checkin", name: "WorkBuddy 每日签到", hhmm: "09:10", kind: "fix" },
     // WorkBuddy 每日成长（任务配置页）：默认 09:00 可改（settings.wb_growth_hhmm）；
     // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
@@ -154,6 +158,10 @@ const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-sessions-compact 档位：每 6 小时合并一次「当天之前」的会话流水
 /// （当天数据由查询层读时聚合即时呈现，无等待诉求）
 const COMPACT_INTERVAL_HOURS: i64 = 6;
+/// trae-jwt-renew 档位（issue #201 P2，固定 6 小时）：hhmm 不参与判定；真实刷新
+/// 仍由 lazy_refresh_needed 门控，轮换频率不因调度加密而增加（main 3.9.4 口径；
+/// mac 侧 qoder-refresh 保留环境配置页可配间隔，两个任务互不共用常量）
+const RENEW_INTERVAL_HOURS: i64 = 6;
 /// 审查修复（第6项；#14 起按账号粒度累计）：buddy-ai 打卡单账号连续失败轮数暂停
 /// 阈值——失效凭证（封禁/会话失效/refresh 永久拒绝）触发的账号失败不可自愈
 ///（T7/BL-5「401 可自愈」只覆盖凭证类瞬时失效），全天 30min 冷却重试 + 每日首败
@@ -270,6 +278,9 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
             let hours = (st.settings().qoder_token_renew_interval_hours.max(1)) as i64;
             SchedPlan::EveryHours(hours)
         }
+        // Trae JWT 续期（issue #201 P2）：固定每 6 小时（hhmm 不参与判定；开关 settings.jwt_renew_enabled）；
+        // 真实刷新仍由 lazy_refresh_needed 门控，轮换频率不因调度加密而增加
+        "renew" => SchedPlan::EveryHours(RENEW_INTERVAL_HOURS),
         // Qoder 会话流水合并：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_sessions_compact_enabled）
         "compact" => SchedPlan::EveryHours(COMPACT_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
@@ -310,7 +321,15 @@ fn tick(
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
-            SchedPlan::Skip => continue,
+            // issue #220 P1：wb-checkin 关闭（auto_checkin=false）不再完全静默——
+            // 状态文件落一行「未开启自动签到，已跳过」摘要；不写 last_run_date，
+            // 当日中途开启后到点仍会补跑。其余任务关闭属正常态，保持静默
+            SchedPlan::Skip => {
+                if t.key == "wb-checkin" {
+                    mark_skip_note(st, t.key, "未开启自动签到，已跳过");
+                }
+                continue;
+            }
             SchedPlan::Daily(hhmm) => {
                 if last_run_date(st, t.key).as_deref() == Some(today.as_str()) {
                     continue;
@@ -436,6 +455,35 @@ fn tick(
                     // cap 触发路径自行复位；此处覆盖正常 done 路径）
                     transient_skip_streak_reset(t.key);
                     fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
+                    // 定时任务完成推送（issue #222）：默认关（notify_on_task_success）。
+                    // 普通空池 skipped（无账号空转，「无 X 账号」类 summary）与 empty_pool
+                    // 同义不推——审查修复 #5：避免 trivial skip 噪声耗尽渠道免费额度；
+                    // 后台版推送（审查修复 #1）：四渠道 HTTP 最坏 ~40s 不阻塞调度 tick
+                    // 循环（app=Some 恢复桌面通知），渠道失败静默，绝不影响调度循环
+                    // 审查修复（major）：成功推送仅限奖励型任务（success_pushable 白名单，
+                    // Daily 语义 mark_run 保证每任务至多 1 次/日，全开 ≤6 条/日）——
+                    // 快照/续期/目录同步类恒开任务最高每 2h 一轮，全量推送每日可达
+                    // 90+ 条，会在故障发生前耗尽 Server酱免费档每日 5 条额度，
+                    // 失败告警反被成功侧挤占发不出去
+                    // P1 审查修复：skipped 双语义放行——字符串 skipped = 整轮幂等跳过
+                    // （busy/空池/暂停，无执行事实，不推送保持原口径）；数字型 skipped
+                    // = 批内确定性跳过账号计数（豆包 run_batch 常规出口，本轮已真实
+                    // 执行并有 success/already 落库，此前被 is_none() 恒 false 永久
+                    // 抑制推送）。数字型仍要求任务在 success_pushable 白名单内，
+                    // 推送频次约束不变
+                    let whole_round_skipped = v
+                        .get("skipped")
+                        .map(|s| s.is_string())
+                        .unwrap_or(false);
+                    if !whole_round_skipped && success_pushable(t.key) {
+                        crate::commands::workbuddy::push_notify_bg(
+                            Some(app.clone()),
+                            st.data_dir.clone(),
+                            &format!("{} 完成", t.name),
+                            &summary,
+                            crate::notify::NotifyEvent::TaskSuccess,
+                        );
+                    }
                     // 看板数据同步成功 → 通知前端重读缓存（issue #61 前端联动：
                     // Dashboard listen 后按 platform 匹配静默 refresh(false)，零额外网络）
                     if let Some(p) = board_platform(t.key) {
@@ -482,13 +530,14 @@ fn tick(
     }
 }
 
-/// 任务生效触发时刻：trae-checkin / trae-renew / wb-growth / wb-checkin 跟随设置页时刻
+/// 任务生效触发时刻：trae-checkin / wb-growth / wb-checkin 跟随设置页时刻
 /// （环境配置页 / 任务配置页可改），看板同步与模型同步跟随各自 settings 时刻；
-/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值
+/// 其余任务用内置默认；配置非法（非 HH:MM 格式）时回退默认值。
+/// 注：trae-renew 已改 EveryHours(6) 调度（sched_plan 短路，不走 Daily），此处
+/// 不再读取 jwt_renew_hhmm（历史配置字段保留兼容旧落盘 JSON）
 fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
     let configured = match t.key {
         "trae-checkin" => Some(st.settings().trae_checkin_hhmm),
-        "trae-renew" => Some(st.settings().jwt_renew_hhmm),
         "wb-growth" => Some(st.settings().wb_growth_hhmm),
         "wb-checkin" => Some(st.settings().wb_checkin_hhmm),
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
@@ -944,18 +993,14 @@ fn run_task(
             // runtime 透传（issue #102 补缺）：签到奖励增量回写运行池余额
             let done = super::qoder_checkin::run_checkin_round(st, &opts, runtime, &mut |_| {});
             // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
-            // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
-            // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns
-            // > 0 判定（对照 qoder_checkin::run_checkin_round 的设计注释）。done 事件恒携带
-            // 该字段；旧结构缺字段时 as_i64 为 None → 0，退回原口径，安全兼容
+            // P2 重试口径：永久性认证失败与 BLOCKED 从重试判定剔除；empty_campaigns
+            //（无签到任务）2026-11-21 起归类 skip、不计入 failed，天然豁免重试
+            //（对照 qoder_checkin::run_checkin_round 的设计注释）
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let failed_empty = done
-                .get("failed_empty_campaigns")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
             // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
-            // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
+            // 重试注定失败，从重试判定剔除——否则失效账号
             // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
+            // issue #223：未满足活动资格（体验版 skip）不计入 failed，自然豁免
             let failed_permanent = done
                 .get("failed_permanent")
                 .and_then(serde_json::Value::as_i64)
@@ -966,7 +1011,7 @@ fn run_task(
                 .get("failed_blocked")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty - failed_permanent - failed_blocked > 0 {
+            if failed - failed_permanent - failed_blocked > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(
@@ -1395,6 +1440,33 @@ fn mark_fail(st: &AppState, key: &str, summary: &str) {
     );
 }
 
+/// 关闭态摘要落盘（issue #220 P1）：wb-checkin 关闭不再完全静默，状态页/排查
+/// 日志可见原因。仅在摘要变化时写（tick 每 60s 一轮，原样重写是无谓落库）；
+/// 合并写入（审查修复）——last_fail_ts 等既有字段保留，重新开启后冷却语义
+/// 连续；缺失条目场景由 write_entry 落整对象，mark_run/mark_fail 仍会自然重建
+fn mark_skip_note(st: &AppState, key: &str, summary: &str) {
+    let state = load_state(st);
+    let cur = state
+        .pointer(&format!("/tasks/{key}/last_summary"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if cur == summary {
+        return;
+    }
+    // 审查修复：write_entry 是 tasks[key]=entry 整体覆盖（C6 注释明言字段丢失
+    // 风险），直接写 {last_summary} 会抹掉 last_fail_ts（失败冷却）/last_ok/
+    // last_run_ts——关→开后会绕过冷却重试、当日已签重复跑。改为读现有 entry
+    // 合并写回，其余字段原样保留
+    let mut entry = state
+        .pointer(&format!("/tasks/{key}"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("last_summary".to_string(), json!(summary));
+    }
+    write_entry(st, key, entry);
+}
+
 fn write_entry(st: &AppState, key: &str, entry: Value) {
     let mut root = load_state(st);
     if let Some(obj) = root.as_object_mut() {
@@ -1408,6 +1480,17 @@ fn write_entry(st: &AppState, key: &str, entry: Value) {
     }
 }
 
+/// 定时任务完成推送（issue #222）白名单：仅奖励型任务（漏跑=丢收益的签到/成长）。
+/// Daily 语义 mark_run 关闭当日重复触发，保证每任务至多推送 1 次/日（全开 ≤6 条）；
+/// 恒开的快照/续期/同步类任务频率高（credits 类默认每 2h、续期每 6h）且无用户
+/// 可操作收益，成功推送纯噪声且挤占渠道免费额度（Server酱 每日 5 条），不推。
+fn success_pushable(task_key: &str) -> bool {
+    matches!(
+        task_key,
+        "trae-checkin" | "wb-checkin" | "qoder-checkin" | "buddy-ai-checkin" | "doubao-checkin" | "wb-growth"
+    )
+}
+
 /// 结果 JSON → 单行摘要（签到/打卡轮次取 ok/already/failed 计数，其余截断展示；
 /// buddy-ai 活跃打卡用「已打」，国内各平台签到仍用「已签」）
 fn summarize(v: &Value, task_key: &str) -> String {
@@ -1415,7 +1498,15 @@ fn summarize(v: &Value, task_key: &str) -> String {
         let get = |k: &str| v.get(k).and_then(Value::as_i64);
         if let (Some(o), Some(a), Some(f)) = (get("ok"), get("already"), get("failed")) {
             let unit = if task_key == "buddy-ai-checkin" { "已打" } else { "已签" };
-            return format!("成功 {o}，{unit} {a}，失败 {f}");
+            // 审查修复：skip（体验版未满足资格，issue #223）单列展示——否则
+            // skip-only 轮次推送「成功 0，已签 0，失败 0」全 0 数字误导
+            let mut s = format!("成功 {o}，{unit} {a}，失败 {f}");
+            // 跳过合计（未满足资格 + 无签到任务，均为确定性跳过非失败）
+            let sk = get("skipped_ineligible").unwrap_or(0) + get("skipped_empty_campaigns").unwrap_or(0);
+            if sk > 0 {
+                s.push_str(&format!("，跳过 {sk}"));
+            }
+            return s;
         }
         // 豆包每日签到（ok 为 bool、计数为 success/already/failed，与额度巡检同构但
         // 无 exhausted 且多 already/reward_total——须先于巡检分支匹配，否则误标
@@ -1432,14 +1523,46 @@ fn summarize(v: &Value, task_key: &str) -> String {
             }
         }
         // 豆包额度巡检（ok 为 bool、计数为 success/failed/exhausted，3.8.5 审查 L2：
-        // 旧逻辑只认 i64 ok 三元组，巡检轮次落入 JSON 截断展示、明细不可读）
-        if let (Some(true), Some(succ), Some(fail)) = (
-            v.get("ok").and_then(Value::as_bool),
-            get("success"),
-            get("failed"),
-        ) {
-            let exh = get("exhausted").unwrap_or(0);
-            return format!("巡检成功 {succ}，失败 {fail}，额度耗尽 {exh}");
+        // 旧逻辑只认 i64 ok 三元组，巡检轮次落入 JSON 截断展示、明细不可读）。
+        // macos_main：本分支须先于 key=value 摘要（main 3.9.4 引入）——布尔 ok 轮次
+        // 有计数字段，中文可读摘要优于 key=value 罗列；无计数字段对象仍走 key=value
+        // macos_main 合并审查 Low：加 task_key 收窄（与上方 doubao-checkin 分支同法）
+        // ——防未来任务结果恰好含 bool ok=true + i64 success/failed 组合被误捕为巡检
+        if task_key == "doubao-quota" {
+            if let (Some(true), Some(succ), Some(fail)) = (
+                v.get("ok").and_then(Value::as_bool),
+                get("success"),
+                get("failed"),
+            ) {
+                // exhausted 兼容计数与明细数组两种形态（审查修复：run_batch 落
+                // Vec<Value> 明细数组，as_i64 取不到 → 摘要恒显「额度耗尽 0」）
+                let exh = v.get("exhausted").map_or(0, |e| {
+                    e.as_i64()
+                        .unwrap_or_else(|| e.as_array().map_or(0, |a| a.len() as i64))
+                });
+                return format!("巡检成功 {succ}，失败 {fail}，额度耗尽 {exh}");
+            }
+        }
+        // 审查修复：无计数字段的对象改用 key=value 摘要（原实现 JSON 序列化截断
+        // 120 字符推送到手机不可读）；嵌套/数组值收窄为 …，整体仍截断 120
+        let parts: Vec<String> = v
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .take(6)
+                    .map(|(k, val)| match val {
+                        Value::String(s) => format!("{k}={s}"),
+                        Value::Number(n) => format!("{k}={n}"),
+                        Value::Bool(b) => format!("{k}={b}"),
+                        Value::Null => format!("{k}=null"),
+                        _ => format!("{k}=…"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !parts.is_empty() {
+            let s = parts.join("，");
+            return s.chars().take(120).collect();
         }
     }
     let s = serde_json::to_string(v).unwrap_or_default();
@@ -1513,11 +1636,12 @@ mod tests {
             .unwrap();
     }
 
-    /// 默认（无 kv）：零值回填链路保证「默认开 + 09:00」（issue #27 语义）
+    /// 默认（无 kv）：零值回填链路保证「默认开」（issue #27 语义）；
+    /// P2（issue #201）：kind 改 "renew" → 每 6 小时（hhmm 不再参与调度判定）
     #[test]
-    fn effective_hhmm_default_0900_and_enabled() {
+    fn renew_plan_default_enabled_every_hours() {
         let st = temp_state("dflt");
-        assert_eq!(effective_hhmm(&st, renew_task()), "09:00");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
         assert!(enabled(&st, "trae-renew"), "默认应启用续期任务");
     }
 
@@ -1536,30 +1660,30 @@ mod tests {
         transient_skip_streak_reset(key);
     }
 
-    /// 环境配置页可改：合法 HH:MM 覆盖内置默认
+    /// 显式配置开关与时刻：开关仍生效（hhmm 不影响 EveryHours 判定，保留 kv 兼容）
     #[test]
-    fn effective_hhmm_follows_settings() {
+    fn renew_plan_ignores_hhmm_setting() {
         let st = temp_state("cfg");
         seed_settings(&st, true, "07:30");
-        assert_eq!(effective_hhmm(&st, renew_task()), "07:30");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
     }
 
-    /// 非法配置回退内置默认：小时越界 / 非 HH:MM 格式 / 分钟越界 / 非法串 / 缺冒号
+    /// 非法配置不致命：enabled 走默认；hhmm 已不参与调度判定，非法值不影响计划
     #[test]
-    fn effective_hhmm_invalid_falls_back() {
+    fn renew_plan_invalid_hhmm_still_every_hours() {
         for bad in ["24:00", "9:00", "07:60", "abc", "0730"] {
             let st = temp_state("bad");
             seed_settings(&st, true, bad);
-            assert_eq!(effective_hhmm(&st, renew_task()), "09:00", "非法值 {bad:?} 应回退默认");
+            assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)), "非法值 {bad:?} 不影响 EveryHours 计划");
         }
     }
 
-    /// 前后空白容忍：trim 后生效
+    /// 前后空白容忍：trim 后 enabled 语义不变（hhmm 不再参与判定，保留用例防回归）
     #[test]
-    fn effective_hhmm_trims_whitespace() {
+    fn renew_plan_whitespace_hhmm_still_every_hours() {
         let st = temp_state("trim");
         seed_settings(&st, true, " 08:15 ");
-        assert_eq!(effective_hhmm(&st, renew_task()), "08:15");
+        assert!(matches!(sched_plan(&st, renew_task()), SchedPlan::EveryHours(6)));
     }
 
     /// 续期时刻配置不外溢：其他任务（wb-checkin）仍用内置 09:10
@@ -1662,6 +1786,9 @@ mod tests {
         assert_eq!(summarize(&v, "doubao-quota"), "巡检成功 3，失败 1，额度耗尽 2");
         let v2 = json!({ "ok": true, "success": 1, "failed": 0 });
         assert_eq!(summarize(&v2, "doubao-quota"), "巡检成功 1，失败 0，额度耗尽 0");
+        // exhausted 为明细数组时取长度计数（审查修复：数组 as_i64 取不到曾恒显 0）
+        let v4 = json!({ "ok": true, "success": 2, "failed": 0, "exhausted": [{"user_id": "u1"}, {"user_id": "u2"}] });
+        assert_eq!(summarize(&v4, "doubao-quota"), "巡检成功 2，失败 0，额度耗尽 2");
         // 签到类 ok/already/failed（i64）仍走第一分支
         let v3 = json!({ "ok": 2, "already": 1, "failed": 0 });
         assert_eq!(summarize(&v3, "trae-checkin"), "成功 2，已签 1，失败 0");
