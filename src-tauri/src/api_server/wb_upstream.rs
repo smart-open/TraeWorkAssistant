@@ -863,14 +863,16 @@ pub fn refresh_access_token(
             .map(|d| dig_str(d, &["refreshToken"]))
             .unwrap_or(None)
     });
+    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移——
+    // 负值算出过去时刻 exp_ms 覆盖旧有效值，网关过期判定恒过期每轮必刷
     let expires_in = body
         .pointer("/expiresIn")
         .or_else(|| body.pointer("/data/expiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(crate::tasks::wb_common::expires_in_secs);
     let refresh_expires_in = body
         .pointer("/refreshExpiresIn")
         .or_else(|| body.pointer("/data/refreshExpiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(crate::tasks::wb_common::expires_in_secs);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1040,14 +1042,15 @@ fn refresh_access_token_intl(
     let new_refresh = dig_str(&body, &["refreshToken"]).or_else(|| {
         body.get("data").and_then(|d| dig_str(d, &["refreshToken"]))
     });
+    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移（口径同 CN 版）
     let expires_in = body
         .pointer("/expiresIn")
         .or_else(|| body.pointer("/data/expiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(crate::tasks::wb_common::expires_in_secs);
     let refresh_expires_in = body
         .pointer("/refreshExpiresIn")
         .or_else(|| body.pointer("/data/refreshExpiresIn"))
-        .and_then(|v| v.as_i64());
+        .and_then(crate::tasks::wb_common::expires_in_secs);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

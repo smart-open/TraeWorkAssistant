@@ -383,7 +383,10 @@ pub(super) fn oauth_flow(
                 if !t.is_empty() {
                     token = t;
                     refresh_token = as_str(fs_utils::dig(&body, &["refreshToken"])).unwrap_or_default();
-                    expires_in_s = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
+                    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移，
+                    // 非法回 None 走 JWT exp 兜底，不用脏值算过去时刻
+                    expires_in_s = fs_utils::dig(&body, &["expiresIn"])
+                        .and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
                     break;
                 }
             }
@@ -505,6 +508,11 @@ pub(super) fn oauth_flow(
         }
         sink.upsert_token(state, &target_id, &creds)?;
     } else {
+        // 审查修复（第六轮 M2）：CN 分支同持每账号刷新锁——OAuth 重扫码 upsert 与
+        // 网关 401 自愈（持 refresh_lock_for 轮换回写）并发时，锁外直写会让旧 rt
+        // 覆盖刚落库的新 rt，账号被迫重登；upsert 内部为读改写合并，锁域罩住调用即可
+        let refresh_lock = crate::tasks::wb_common::refresh_lock_for(&target_id);
+        let _refresh_guard = refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
         sink.upsert_token(state, &target_id, &creds)?;
     }
     fs_utils::app_log(

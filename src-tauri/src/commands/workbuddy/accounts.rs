@@ -855,8 +855,11 @@ pub fn workbuddy_refresh_token(
     };
     let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
     let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| v.as_i64());
-    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| v.as_i64());
+    // 审查修复（第五/六轮收敛）：expires_in_secs 过滤 0/负值/数字串漂移，非法回 None
+    let expires_in: Option<i64> =
+        fs_utils::dig(&body, &["expiresIn"]).and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
+    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"])
+        .and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
@@ -882,8 +885,11 @@ pub fn workbuddy_refresh_token(
         let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut pool = load_pool(&state);
         if let Some(a) = pool.accounts.iter_mut().find(|a| a.id == acct.id) {
-            a.access_token_expires_at = exp_ms.map(|m| m / 1000);
-            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000);
+            // 审查修复（Low 收口）：响应缺 expiresIn/refreshExpiresIn 时保留池内
+            // 旧值——清成 None 会让 lazy_renew_skippable 恒放行、兜底续期每轮必刷
+            // （对齐 buddy_ai_refresh_impl 池回写 .or(旧值) 同口径）
+            a.access_token_expires_at = exp_ms.map(|m| m / 1000).or(a.access_token_expires_at);
+            a.refresh_token_expires_at = rexp_ms.map(|m| m / 1000).or(a.refresh_token_expires_at);
             a.needs_relogin = false;
             a.relogin_reason.clear();
             save_pool(&state, &pool)?;

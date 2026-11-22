@@ -330,6 +330,14 @@ fn stream_convert_src(
                     if saw_done {
                         continue;
                     }
+                    // 审查修复（第三轮 Medium）：error→done 序列下真实业务错误优先——
+                    // error 未流出时延迟上抛（不 break），随后 done 会无条件以 EMPTY
+                    // 哨兵覆盖 error_info，真实错误丢失。已有错误且无内容直接收束；
+                    // 交叉审查回落：内容已流出时（error 后上游继续吐内容的罕见序列）
+                    // 不提前 break，回落正常收尾发 finish+[DONE]，防客户端收到截断流
+                    if error_info.is_some() && !has_content {
+                        break;
+                    }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
                         // 调用方换号重试（issue #57，不再把空响应伪装成正常完成）
@@ -521,6 +529,12 @@ fn stream_convert_text_src(
                     // 首个完成帧已发则忽略后续，防同一 SSE 流拼接第二份收尾帧
                     if saw_done {
                         continue;
+                    }
+                    // 审查修复（第三轮 Medium）：error→done 序列下真实业务错误优先，
+                    // 口径同 stream_convert_lines（已有错误且无内容才收束；内容已流出
+                    // 时回落正常收尾防截断流，同上）
+                    if error_info.is_some() && !has_content {
+                        break;
                     }
                     if !has_content {
                         // 空完成（影子风控/上游异常）：不发收尾帧，以哨兵错误上抛
@@ -1332,6 +1346,15 @@ fn stream_convert_anthropic_src(
                     // 客户端属协议违规——首帧后静默忽略后续完成事件
                     if saw_done {
                         continue;
+                    }
+                    // 审查修复（第三轮 Medium）：error→done 序列下真实业务错误优先，
+                    // 口径同前两个转换器——error 未流出（message_started=false 且
+                    // tools 空）且随后 done 无内容时，done 会以 EMPTY 哨兵覆盖
+                    // error_info，此处提前收束保留真实错误；交叉审查回落：内容已流出
+                    // 时（error 后上游继续吐内容的罕见序列）不提前 break，回落正常
+                    // 收尾发 message_delta/message_stop，防客户端收到截断流
+                    if error_info.is_some() && !(message_started || !tools.is_empty()) {
+                        break;
                     }
                     if !ev.finish_reason.is_empty() {
                         finish_reason = ev.finish_reason;

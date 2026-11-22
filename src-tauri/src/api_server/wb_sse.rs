@@ -632,10 +632,11 @@ pub fn stream_forward_ex(
                     usage = Some(x);
                 }
                 // 真实内容标记（issue #57 空完成检测）：空 delta chunk 不计入。
-                // 同帧载荷判定复用为 Anthropic message_start 的延迟发送条件
-                //（审查修复 L：纯噪声帧不再提前触发 message_start）
-                let frame_has_payload =
-                    delta.get("content").and_then(|c| c.as_str()).map_or(false, |s| !s.is_empty())
+                // frame_has_payload 同时供 Anthropic message_start 门控（下方）
+                let frame_has_payload = delta
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map_or(false, |s| !s.is_empty())
                     || delta
                         .get("reasoning_content")
                         .and_then(|c| c.as_str())
@@ -648,10 +649,11 @@ pub fn stream_forward_ex(
                     has_content = true;
                 }
                 if proto == crate::api_server::routes::Protocol::Anthropic {
-                    // 审查修复（issue #96 噪声帧 + 空完成换号重试协议违规）：
-                    // message_start 延迟到首个真实载荷帧再发——纯噪声 delta 帧
-                    // 不提前开启 message，避免空完成换号重试时同一 SSE 流收到
-                    // 重复 message_start / 悬空 message（严格客户端协议违规）
+                    // 审查修复（第六轮 M1）：message_start 门控到本帧确有载荷——
+                    // 噪声帧/空 delta 不再提前下发 message_start。原实现无条件调用：
+                    // 影子风控（空 delta 噪声流）场景客户端已收 message_start，
+                    // 空完成换号重试会向同一流拼接第二份完整响应。对齐 Responses
+                    // 侧 created 门控不变式（message_start 已发 ⟺ 流内有载荷）
                     if frame_has_payload {
                         anthropic_start(tx, &mut message_started, chat_id, model);
                     }
@@ -737,7 +739,12 @@ pub fn stream_forward_ex(
                                 }
                             }
                         }
-                        sent_any = true;
+                        // 审查修复（第六轮 M1）：空数组不置 sent_any——issue #96 确认
+                        // Buddy 上游噪声帧携带恒空 tool_calls 数组，置位会让调用方误判
+                        // 「已流出数据」，空完成换号重试失效（noise-only 流错过换号）
+                        if !tcs.is_empty() {
+                            sent_any = true;
+                        }
                     }
                 } else {
                     match proto {

@@ -378,8 +378,9 @@ fn run_checkin_worker(
                 match round_error_types.get(*uid).map(|e| e.as_str()) {
                     // SessionDead=JWT 被服务端吊销（永久）；AuthRejected=服务端拒绝认证
                     // （issue #128，凭证级失效重试无法自愈）；DeviceSigned=服务端按设备
-                    // 当日去重（issue #110，次日 0 点自动解除）——重试必然同样失败，跳过以免白等
-                    Some("SessionDead") | Some("DeviceSigned") | Some("AuthRejected") => false,
+                    // 当日去重（issue #110，次日 0 点自动解除）；BadJwt=JWT 损坏无法解析
+                    // （1373b5c2 合入，重抓凭证前重试必然再失败）——重试必然同样失败，跳过以免白等
+                    Some("SessionDead") | Some("DeviceSigned") | Some("AuthRejected") | Some("BadJwt") => false,
                     _ => true,
                 }
             })
