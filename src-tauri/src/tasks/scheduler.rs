@@ -550,9 +550,12 @@ fn run_task(
                     if e.get("message").and_then(Value::as_str) == Some("未配置 jwt") {
                         return true;
                     }
+                    // 审查修复（第六轮 M1）：损坏 JWT（存在但无法解析 user id）同属
+                    // 永久类——重抓凭证前重试必然无效，排除出可重试计数防全天 8 轮
+                    // 无效重试 + 每轮失败推送噪声
                     matches!(
                         e.get("error_type").and_then(Value::as_str),
-                        Some("SessionDead") | Some("AuthRejected") | Some("DeviceSigned")
+                        Some("BadJwt") | Some("SessionDead") | Some("AuthRejected") | Some("DeviceSigned")
                     )
                 })
                 .count() as i64;

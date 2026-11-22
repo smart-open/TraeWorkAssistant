@@ -100,6 +100,24 @@ pub fn http_agent(timeout_secs: u64) -> ureq::Agent {
         .build()
 }
 
+/// 代理 URL 日志脱敏（docker 审查 M2）：`http://user:pass@host[:port]` 形态的
+/// 内嵌凭证不落 stderr/docker logs——保留 scheme:// 与最后一个 '@' 之后的
+/// host[:port]；无 '@' 原样返回。
+pub fn sanitize_proxy_url_for_log(url: &str) -> String {
+    match url.rfind('@') {
+        Some(pos) => {
+            // scheme 取首个 "://"（且须在凭证 '@' 之前，密码可能含 '@'/'://'）
+            let scheme = url
+                .find("://")
+                .filter(|&i| i < pos)
+                .map(|i| &url[..i + 3])
+                .unwrap_or("");
+            format!("{scheme}{}", &url[pos + 1..])
+        }
+        None => url.to_string(),
+    }
+}
+
 /// 单账号独立出口代理（P4 防风控）：proxy_url 配置成功则按同参数构建带代理的
 /// agent；URL 非法/为空回退直连（与 http_agent 同配置）。每账号独立 agent
 /// 避免连接池复用把不同出口的 TCP/会话指纹串到一起。
@@ -109,9 +127,13 @@ pub fn http_agent_with_proxy(timeout_secs: u64, proxy_url: Option<&str>) -> ureq
         .filter(|s| !s.is_empty())
         .and_then(|s| match ureq::Proxy::new(s) {
             Ok(p) => Some(p),
-            // 纯函数无 data_dir/app logger 上下文，沿用本模块 eprintln! 先例
+            // 纯函数无 data_dir/app logger 上下文，沿用本模块 eprintln! 先例；
+            // 审查修复（M2）：URL 经 sanitize 后输出，内嵌 user:pass 不泄进日志
             Err(e) => {
-                eprintln!("单账号代理 URL 解析失败（已回退直连）: {s} — {e}");
+                eprintln!(
+                    "单账号代理 URL 解析失败（已回退直连）: {} — {e}",
+                    sanitize_proxy_url_for_log(s)
+                );
                 None
             }
         });
@@ -403,5 +425,34 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             println!("{}", serde_json::json!({"ok": false, "error": e}));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_proxy_url_for_log;
+
+    #[test]
+    fn proxy_log_sanitizer_strips_credentials() {
+        // 基本形态：user:pass 内嵌凭证不回显
+        assert_eq!(
+            sanitize_proxy_url_for_log("http://alice:s3cret@proxy.example.com:8080"),
+            "http://proxy.example.com:8080"
+        );
+        // 密码含 '@'：取最后一个 '@' 之后
+        assert_eq!(
+            sanitize_proxy_url_for_log("http://alice:p@ss@proxy.example.com"),
+            "http://proxy.example.com"
+        );
+        // 无凭证原样返回
+        assert_eq!(
+            sanitize_proxy_url_for_log("socks5://proxy.example.com:1080"),
+            "socks5://proxy.example.com:1080"
+        );
+        // 无 scheme 仅凭证段
+        assert_eq!(
+            sanitize_proxy_url_for_log("user:pass@10.0.0.1"),
+            "10.0.0.1"
+        );
     }
 }

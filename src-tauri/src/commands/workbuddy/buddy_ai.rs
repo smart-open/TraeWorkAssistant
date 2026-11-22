@@ -672,14 +672,12 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     };
     let new_access = as_str(fs_utils::dig(&body, &["accessToken"])).ok_or("刷新响应中无 accessToken")?;
     let new_refresh = as_str(fs_utils::dig(&body, &["refreshToken"]));
-    // 宽容解析：expiresIn 可能以数字字符串返回（字段漂移时 as_i64 会静默丢失 →
-    // 池过期时间被清成 None → 兜底续期从此永不选中该账号）
-    let num_of = |v: &Value| -> Option<i64> {
-        v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-    };
-    let expires_in: Option<i64> = fs_utils::dig(&body, &["expiresIn"]).and_then(|v| num_of(v));
-    let refresh_expires_in: Option<i64> =
-        fs_utils::dig(&body, &["refreshExpiresIn"]).and_then(|v| num_of(v));
+    // 宽容解析 + 过滤（审查第五/六轮收敛）：expiresIn 可能以数字字符串返回；
+    // expires_in_secs 统一过滤 0/负值/超界漂移，非法回 None（调用方按盲区语义回填旧值）
+    let expires_in: Option<i64> =
+        fs_utils::dig(&body, &["expiresIn"]).and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
+    let refresh_expires_in: Option<i64> = fs_utils::dig(&body, &["refreshExpiresIn"])
+        .and_then(|v| crate::tasks::wb_common::expires_in_secs(&v));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let exp_ms = expires_in.map(|s| now_ms + s * 1000);
     let rexp_ms = refresh_expires_in.map(|s| now_ms + s * 1000);
@@ -687,6 +685,11 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
     // rt 轮换回写（R-2a：每次刷新轮换；响应缺失时保留旧值防丢）。
     // 审查修复（M1）：合并式写回（在旧 rec 上更新四键）——upsert 是整行 REPLACE，
     // 从零构造会抹掉打卡幂等戳 last_daily_chat 与 uid 兜底，刷新一次当日打卡即被重跑
+    // 审查修复（第四轮 Medium）：响应缺 expiresIn/refreshExpiresIn 时从 existing
+    // 回填旧到期时间（null 不覆盖）——整行 REPLACE 抹成 null 会让惰性续期按缺失
+    // 放行多续、rt 临期判定回退 None 盲区；池回写已有 .or(旧值) 同口径
+    let old_exp_ms = fs_utils::dig(&rec, &["expires_at_ms"]).and_then(|v| v.as_i64());
+    let old_rexp_ms = fs_utils::dig(&rec, &["refresh_expires_at_ms"]).and_then(|v| v.as_i64());
     let mut merged = if rec.is_object() { rec.clone() } else { serde_json::json!({}) };
     if let Some(rm) = merged.as_object_mut() {
         rm.insert("access_token".into(), json!(new_access));
@@ -698,8 +701,14 @@ pub(crate) fn buddy_ai_refresh_impl(state: &AppState, user_id: &str) -> Result<S
                 new_refresh.clone().unwrap_or_default()
             }),
         );
-        rm.insert("expires_at_ms".into(), json!(exp_ms));
-        rm.insert("refresh_expires_at_ms".into(), json!(rexp_ms));
+        rm.insert(
+            "expires_at_ms".into(),
+            json!(exp_ms.or(old_exp_ms)),
+        );
+        rm.insert(
+            "refresh_expires_at_ms".into(),
+            json!(rexp_ms.or(old_rexp_ms)),
+        );
         rm.insert("domain".into(), json!(intl_domain_or(as_str(fs_utils::dig(&rec, &["domain"])))));
     }
     crate::tasks::wb_common::buddy_ai_token_store_upsert(&state.data_dir, &acct.id, &merged)?;

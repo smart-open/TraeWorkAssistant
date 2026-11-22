@@ -729,8 +729,16 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                 }
             }
             None => {
-                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）
-                if fail_reason == Some(wb_common::RefreshFail::Auth) {
+                // 凭证失效才标记重登录；网络故障/响应异常/他方进程刷新中不误标（审查 P1-4 + H-1）。
+                // M16 同口径分流：仅 Auth/NoRefreshToken 归为登录态问题（需重新登录），
+                // Network/BadResponse/Busy 属瞬时失败，如实报「稍后自动重试」——
+                // 否则刷新瞬时失败文案含「需重新登录」被调度器子串匹配判永久，
+                // 健康账号一次网络抖动即当日停摆
+                let auth_dead = matches!(
+                    fail_reason,
+                    Some(wb_common::RefreshFail::Auth) | Some(wb_common::RefreshFail::NoRefreshToken)
+                );
+                if auth_dead {
                     // issue #118：透传上游 error/error_description，便于区分会话失效与账号封禁
                     let mut reason = format!("签到 refresh 失败: {message}");
                     if let Some(d) = fail_detail.as_deref() {
@@ -739,12 +747,22 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
                     wb_common::mark_needs_relogin(state, &aid, &reason);
                 }
                 kind = "fail".into();
-                message = match fail_detail.as_deref() {
-                    Some(d) => format!(
-                        "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
-                        wb_common::refresh_fail_hint(d)
-                    ),
-                    None => "登录态失效且刷新失败，需重新登录".into(),
+                message = if auth_dead {
+                    match fail_detail.as_deref() {
+                        Some(d) => format!(
+                            "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
+                            wb_common::refresh_fail_hint(d)
+                        ),
+                        None => "登录态失效且刷新失败，需重新登录".into(),
+                    }
+                } else {
+                    match fail_detail.as_deref() {
+                        Some(d) => format!(
+                            "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试；上游: {d}（{}）",
+                            wb_common::refresh_fail_hint(d)
+                        ),
+                        None => "刷新暂时失败（网络/响应异常或他方进程刷新中），稍后自动重试".into(),
+                    }
                 };
                 reward = None;
                 delayed = false;
@@ -930,7 +948,10 @@ where
             // 归一为 fail 并回写 needs_relogin（避免 auth 泄漏到上层结果）
             if kind2 == "auth" {
                 wb_common::mark_needs_relogin(state, acct_id, "刷新后仍 401");
-                return ("fail".into(), "登录态失效（刷新后仍 401），需重新登录".into());
+                return (
+                    "fail".into(),
+                    "登录态失效（刷新后仍 401），需重新登录".into(),
+                );
             }
             return (kind2, msg2);
         }
@@ -951,10 +972,10 @@ where
             wb_common::mark_needs_relogin(state, acct_id, &reason);
             let msg_fail = match fail_detail.as_deref() {
                 Some(d) => format!(
-                    "登录态失效且刷新失败；上游: {d}（{}）",
+                    "登录态失效且刷新失败，需重新登录；上游: {d}（{}）",
                     wb_common::refresh_fail_hint(d)
                 ),
-                None => "登录态失效且刷新失败".into(),
+                None => "登录态失效且刷新失败，需重新登录".into(),
             };
             return ("fail".into(), msg_fail);
         }
@@ -1361,16 +1382,27 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let urls = urls_for(wb_common::region_billing_base(&creds.domain));
 
     let mut result = Map::new();
+    // 审查修复（第三轮 High 回归）：记录最后一步失败文案，供事件补 message 字段
+    let mut last_fail_msg = String::new();
     if flags.travel {
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_travel(state, agent, h, &urls));
+        if kind == "fail" {
+            last_fail_msg = msg.clone();
+        }
         result.insert("travel".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     if flags.lottery {
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_lottery(agent, h, &urls));
+        if kind == "fail" {
+            last_fail_msg = msg.clone();
+        }
         result.insert("lottery".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     if flags.tasks {
         let (kind, msg) = with_retry(state, agent, &aid, &creds, |h| growth_tasks(agent, h, &urls));
+        if kind == "fail" {
+            last_fail_msg = msg.clone();
+        }
         result.insert("tasks".into(), json!(if kind == "fail" { "fail" } else { msg.as_str() }));
     }
     // 能量/连签（不带刷新重试，纯展示）
@@ -1391,6 +1423,13 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     let mut ev = json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": status });
     for (k, v) in result {
         ev[k.as_str()] = v;
+    }
+    // 审查修复（第三轮 High 回归）：失败事件补 message——调度器按 message 子串
+    //（「需重新登录」/「无可用凭证」）判定永久失败剔除重试，缺 message 时死号
+    // 被当可重试失败全天 30→120min 退避重试。with_retry 的 fail 文案已含
+    // 「需重新登录」，直接透传即可
+    if status == "fail" && !last_fail_msg.is_empty() {
+        ev["message"] = json!(last_fail_msg);
     }
     ev
 }
@@ -1419,6 +1458,22 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
         let proxy_url = acct.get("proxy_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         let acct_agent = proxy_url.map(|p| http_agent_with_proxy(30, Some(p)));
         let agent = acct_agent.as_ref().unwrap_or(&agent);
+        // 交叉审查修复（No.5）：跳过已标死号（needs_relogin）——对齐签到轮
+        // process_account 的 skip_expired 门控，防死号在后续每个 growth 调度轮
+        // 被重复选中刷 401/刷新链；事件保持 fail 口径供调度器计数归档
+        if py_truthy(acct.get("needs_relogin")) {
+            let aid = s_of(acct.get("id"));
+            let name = first_str(&[
+                acct.get("nickname").and_then(Value::as_str).map(str::to_string),
+                Some(s_of(acct.get("uid")).chars().take(8).collect()),
+                Some(aid.clone()),
+            ]);
+            emit(&json!({
+                "type": "growth", "index": i + 1, "user_id": aid, "name": name,
+                "status": "fail", "message": "需重新登录，已跳过",
+            }));
+            continue;
+        }
         let mut ev = process_account_growth(state, agent, acct, flags);
         ev["index"] = json!(i + 1);
         emit(&ev);

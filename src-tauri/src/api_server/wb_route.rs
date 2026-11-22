@@ -2036,6 +2036,18 @@ pub(crate) fn run_wb_stream(
                                         if e == wb_upstream::ERR_PEER_REFRESHING {
                                             break;
                                         }
+                                        // 审查修复（第六轮 M1）：传输层错误（ureq 网络/响应异常，
+                                        // 统一「刷新请求失败: 」前缀）同样属瞬时失败——不 break 会
+                                        // 落入 classify_wb_http_error(401)→SessionDead 禁用健康账号
+                                        //（且 disabled 无手动启用入口），直至进程重启；仅凭证级失效
+                                        //（刷新端点 HTTP 错误）才走 classify 落 SessionDead。
+                                        // 交叉审查补口：「刷新响应读取失败」（into_json 解码失败）
+                                        // 同为传输层瞬时故障，一并放行
+                                        if e.starts_with("刷新请求失败")
+                                            || e.starts_with("刷新响应读取失败")
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -2633,6 +2645,14 @@ pub(crate) fn run_wb_aggregate_inner(
                                             // 他方进程刷新中：本轮换号且不走 note_error（防瞬时
                                             // 忙态误置 disabled），对方刷新结果由下轮请求复用
                                             if e == wb_upstream::ERR_PEER_REFRESHING {
+                                                break;
+                                            }
+                                            // 审查修复（第六轮 M1）：传输层错误同属瞬时失败，
+                                            // 不 classify（口径同上方流式路径）；交叉审查补口：
+                                            // 「刷新响应读取失败」（解码失败）一并放行
+                                            if e.starts_with("刷新请求失败")
+                                                || e.starts_with("刷新响应读取失败")
+                                            {
                                                 break;
                                             }
                                         }
@@ -3642,6 +3662,17 @@ pub async fn wb_tool_exec_chat(
                                             if e == wb_upstream::ERR_PEER_REFRESHING {
                                                 break Err(format!(
                                                     "wb-toolexec refresh uid={} 他方进程正在刷新，本轮换号",
+                                                    picked.uid
+                                                ));
+                                            }
+                                            // 审查修复（第六轮 M1）：传输层错误同属瞬时失败，
+                                            // 不 classify（口径同流式/聚合路径）；交叉审查补口：
+                                            // 「刷新响应读取失败」（解码失败）一并放行
+                                            if e.starts_with("刷新请求失败")
+                                                || e.starts_with("刷新响应读取失败")
+                                            {
+                                                break Err(format!(
+                                                    "wb-toolexec refresh uid={} 刷新瞬时失败（网络/响应异常），本轮换号",
                                                     picked.uid
                                                 ));
                                             }
