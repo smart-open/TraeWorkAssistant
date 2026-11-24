@@ -14,6 +14,14 @@
 //! 不启动 Tauri（分支在 Builder 之前，天然绕开单实例插件）。任务名随批次扩展：
 //! P1 `doubao-quota`；P2 `wb-checkin`/`wb-renew`/`checkin`；P3 `doubao-renew`。
 
+pub mod codearts_catalog;
+pub mod codearts_checkin;
+pub mod codearts_common;
+pub mod codearts_credits;
+pub mod codearts_diag;
+pub mod codearts_oauth;
+pub mod codearts_refresh;
+pub mod codearts_sign;
 pub mod doubao_chats;
 pub mod doubao_checkin;
 pub mod doubao_probe;
@@ -303,6 +311,27 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-refresh" => qoder_refresh::run_task(state),
         // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
         "qoder-catalog-sync" => qoder_catalog::run_task(state),
+        // CodeArts 每日签到（schtasks 直调 + 应用内调度器共用）
+        "codearts-checkin" => {
+            let opts = codearts_checkin::CodeartsCheckinOpts::daily();
+            let done = codearts_checkin::run_checkin_round(state, &opts, &mut print_progress);
+            let fail = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let fail_perm = done.get("failed_permanent").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let fail_empty = done.get("failed_empty_campaigns").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if fail - fail_perm - fail_empty > 0 {
+                Err(format!("CodeArts 签到：{fail} 个账号失败"))
+            } else {
+                Ok(done)
+            }
+        }
+        // CodeArts 积分快照（调度器/CLI 共用）
+        "codearts-credits-snapshot" => codearts_credits::run_snapshot_task(state),
+        // CodeArts 诊断：抓真实端点原始响应到 data/codearts_diag.json（仅排查用）
+        "codearts-diag" => Ok(serde_json::json!({ "exit": codearts_diag::run(state) })),
+        // CodeArts 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转）
+        "codearts-catalog-sync" => codearts_catalog::run_task(state),
+        // CodeArts OAuth 凭证 6h 兜底刷新（调度器/CLI 共用；跨进程锁防 refresh_token 争抢）
+        "codearts-refresh" => codearts_refresh::run_task(state),
         // Buddy 国际版积分数据同步 / 凭证兜底续期 / 模型目录同步（调度器/CLI 共用；
         // runtime=None：CLI 独立进程无网关运行态，仅落库不做运行池拨新）
         "buddy-ai-credits-sync" => crate::commands::workbuddy::buddy_ai_credits_sync_impl(state, None)

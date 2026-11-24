@@ -36,7 +36,7 @@ import type {
 } from '../../types';
 
 /** 资源池筛选（§5.2：全部/Trae/Buddy/BuddyAI 国际/Qoder/自定义模型） */
-export type PoolFilter = 'all' | 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'custom';
+export type PoolFilter = 'all' | 'trae' | 'buddy' | 'buddy-ai' | 'qoder' | 'codearts' | 'custom';
 
 const FILTER_LABELS: Record<PoolFilter, string> = {
   all: '全部',
@@ -44,6 +44,7 @@ const FILTER_LABELS: Record<PoolFilter, string> = {
   buddy: 'Buddy',
   'buddy-ai': 'BuddyAI',
   qoder: 'Qoder',
+  codearts: 'CodeArts',
   custom: '自定义',
 };
 
@@ -189,6 +190,7 @@ export default function UsageStatsPanel() {
   const [buddyAiUsage, setBuddyAiUsage] = useState<UsageDayView[]>([]);
   const [customUsage, setCustomUsage] = useState<UsageDayView[]>([]);
   const [qoderUsage, setQoderUsage] = useState<UsageDayView[]>([]);
+  const [codeartsUsage, setCodeartsUsage] = useState<UsageDayView[]>([]);
   const [loading, setLoading] = useState(false);
   // 审查修复（L30）：快速切换 7/14/30 天时并发 load 的旧响应可能晚于新响应到达，
   // 用序号门控：响应到达时仅当仍是最新一次发起才 setState，防止旧数据覆盖新结果
@@ -198,12 +200,13 @@ export default function UsageStatsPanel() {
     const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
-      const [trae, buddy, buddyAi, custom, qoder] = await Promise.all([
+      const [trae, buddy, buddyAi, custom, qoder, codearts] = await Promise.all([
         api.apiServer.usageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.wbUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.buddyAiUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.customUsageStats(d).catch(() => [] as UsageDayView[]),
         api.apiServer.qoderUsageStats(d).catch(() => [] as UsageDayView[]),
+        api.apiServer.codeArtsUsageStats(d).catch(() => [] as UsageDayView[]),
       ]);
       if (seq !== loadSeqRef.current) return;
       setTraeUsage(trae);
@@ -211,6 +214,7 @@ export default function UsageStatsPanel() {
       setBuddyAiUsage(buddyAi);
       setCustomUsage(custom);
       setQoderUsage(qoder);
+      setCodeartsUsage(codearts);
     } finally {
       if (seq === loadSeqRef.current) setLoading(false);
     }
@@ -232,9 +236,10 @@ export default function UsageStatsPanel() {
     if (effFilter === 'buddy') return buddyUsage;
     if (effFilter === 'buddy-ai') return buddyAiUsage;
     if (effFilter === 'qoder') return qoderUsage;
+    if (effFilter === 'codearts') return codeartsUsage;
     if (effFilter === 'custom') return customUsage;
-    return mergeBuckets(traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage);
-  }, [effFilter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, customUsage]);
+    return mergeBuckets(traeUsage, buddyUsage, buddyAiUsage, qoderUsage, codeartsUsage, customUsage);
+  }, [effFilter, traeUsage, buddyUsage, buddyAiUsage, qoderUsage, codeartsUsage, customUsage]);
 
   // ---- Custom 池会话明细（issue #149 P2）：仅 effFilter==='custom' 时加载 ----
   const [sessData, setSessData] = useState<UsageSessionsResult | null>(null);
@@ -400,7 +405,7 @@ export default function UsageStatsPanel() {
   const visibleFilters = (Object.keys(FILTER_LABELS) as PoolFilter[]).filter(
     (f) => f === 'all' || f === 'custom' || isPoolVisible(settings, f),
   );
-  const poolHintLabels = (['trae', 'buddy', 'buddy-ai', 'qoder'] as const)
+  const poolHintLabels = (['trae', 'buddy', 'buddy-ai', 'qoder', 'codearts'] as const)
     .filter((f) => isPoolVisible(settings, f))
     .map((f) => FILTER_LABELS[f]);
   const filterHint =

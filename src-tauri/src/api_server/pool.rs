@@ -80,6 +80,16 @@ impl PoolStrategy {
         })
     }
 
+    /// CodeArts 池生效策略：codearts_strategy 独立配置优先；空 = 跟随 Trae 池。
+    /// 隔离理由同 resolve_qoder
+    pub fn resolve_codearts(strategy: &str, codearts_strategy: &str) -> Self {
+        Self::parse(if codearts_strategy.is_empty() {
+            strategy
+        } else {
+            codearts_strategy
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",
@@ -770,6 +780,51 @@ impl ApiPool {
         }
     }
 
+    /// 从 CodeArts 账号同步池（阶段2）：专用池实例，全量重建语义同 sync_from_wb。
+    /// AK/SK 明文不入池（jwt 槽位留空），请求期真凭证由 codearts_identity 回调
+    /// 按次解析；enabled 列表即生效入池白名单，空令牌账号（无 AK/SK）跳过。
+    pub fn sync_from_codearts(&self, accounts: &[CodeartsSyncAccount], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        entries.clear();
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) || !a.enabled {
+                continue;
+            }
+            entries.insert(
+                a.uid.clone(),
+                PoolEntry {
+                    uid: a.uid.clone(),
+                    name: a.name.clone(),
+                    // AK/SK 零明文：池内凭证槽位恒空
+                    jwt: String::new(),
+                    credits: a.credits,
+                    credits_expire_at: a.credits_expire_at,
+                    credits_fetched_at: a.credits_fetched_at,
+                    disabled: false,
+                    err_count: 0,
+                    until: 0,
+                    reason: String::new(),
+                    device_id: String::new(),
+                    machine_id: String::new(),
+                    hard_until: 0,
+                    last_used: 0,
+                    successes: 0,
+                    failures: 0,
+                    cb_trips: 0,
+                    domain: String::new(),
+                    enterprise_id: String::new(),
+                    global_region: false,
+                    refresh_invalid: false,
+                },
+            );
+        }
+        {
+            let mut inflight = safe_lock(&self.inflight);
+            inflight.retain(|uid, _| entries.contains_key(uid));
+        }
+    }
+
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None。
     /// `skip_credit_filters`：跳过积分维度过滤（issue #111 免费模型豁免，
     /// 仅 Qoder 免费模型取号路径传 true），见 [`selectable`]
@@ -980,12 +1035,14 @@ impl ApiPool {
             let entries = safe_lock(&self.entries);
             let now = now_ts();
             let tried = HashSet::new();
+            // has_other：fold 只遍历已通过 selectable/allowed 过滤的条目，
+            // 能进到闭包即说明存在其他健康候选
             entries
                 .values()
                 .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
-                .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
-                .fold((false, false), |(any, idle), e| {
-                    (any || true, idle || inflight_of(e, &inflight) < limit)
+                .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
+                .fold((false, false), |(_any, idle), e| {
+                    (true, idle || inflight_of(e, &inflight) < limit)
                 })
         };
         if !has_other {
@@ -1400,6 +1457,30 @@ impl ApiPool {
         (count, earliest)
     }
 
+    /// 软冷却（账号级限流冷却）统计：返回 (处于软冷却中的账号数, 最早恢复
+    /// 时刻 Unix 秒)。与 [Self::hard_credit_stats] 互补——hard 是「积分耗尽，
+    /// 等次日 04:00」，软冷却是「上游限流，等几十秒」。
+    ///
+    /// 用途：池内账号全部处于软冷却时，`has_selectable_in` 为 false，
+    /// 调度会判「无健康账号」并回 503——但真实根因是「上游限流中，稍后
+    /// 重试」，应回 429 + 退避秒数，否则客户端把瞬时限流当网关故障。
+    pub fn soft_cooldown_stats(&self) -> (usize, Option<i64>) {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        let mut count = 0usize;
+        let mut earliest: Option<i64> = None;
+        for e in entries.values() {
+            if e.until > now && !e.disabled && e.hard_until <= now {
+                count += 1;
+                earliest = Some(match earliest {
+                    Some(t) => t.min(e.until),
+                    None => e.until,
+                });
+            }
+        }
+        (count, earliest)
+    }
+
     /// 诊断：返回所有账号被过滤的原因（用于 "no healthy account" 排查）
     pub fn diagnose(&self) -> Vec<PoolDiagnosis> {
         let entries = safe_lock(&self.entries);
@@ -1520,6 +1601,21 @@ pub struct QoderSyncAccount {
     /// selectable 到期过滤的数据源；None = 无到期信息
     pub credits_expire_at: Option<i64>,
     /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
+    pub credits_fetched_at: Option<i64>,
+}
+
+/// CodeArts 账号入池同步结构（阶段2）：uid 即 codearts 账号 id（token store 键）。
+/// AK/SK 明文不随本结构入池（池内 jwt 槽位恒空，真凭证由 identity 回调按需解析）。
+pub struct CodeartsSyncAccount {
+    pub uid: String,
+    pub name: String,
+    /// 是否入池（有凭证 = true；无凭证账号跳过）
+    pub enabled: bool,
+    /// 余额快照（无快照/旧数据 = None，reserve 过滤 fail-open）
+    pub credits: Option<f64>,
+    /// 最早积分包到期（Unix 秒）；None = 无到期信息
+    pub credits_expire_at: Option<i64>,
+    /// 余额快照采集时间（Unix 秒）
     pub credits_fetched_at: Option<i64>,
 }
 
@@ -1854,8 +1950,55 @@ mod tests {
         assert_eq!(until3, Some(earlier), "剩余最早恢复时刻取未禁用账号");
     }
 
-    // ==================== F-80：冷却/禁用标记落 app.log ====================
+    // ==================== soft_cooldown_stats（上游限流软冷却） ====================
 
+    /// 软冷却（上游限流）统计：池内账号全部处于软冷却时，调度不能再报
+    /// 「无健康账号」503——真实根因是「上游限流中」，应回 429 + 退避秒数。
+    #[test]
+    fn soft_cooldown_stats_counts_and_earliest() {
+        let pool = build_pool(&[("ca-a", 50.0, 0), ("ca-b", 50.0, 0), ("ca-c", 50.0, 0)]);
+        let (n0, until0) = pool.soft_cooldown_stats();
+        assert_eq!(n0, 0, "初始无软冷却账号");
+        assert!(until0.is_none(), "初始无恢复时刻");
+
+        // SoftRate（限流）→ 进入软冷却
+        pool.note_error("ca-a", ErrKind::SoftRate);
+        let (n1, until1) = pool.soft_cooldown_stats();
+        assert_eq!(n1, 1, "SoftRate 后应计 1 个软冷却账号");
+        let until = until1.expect("应有恢复时刻");
+        assert!(until > now_ts(), "恢复时刻应在未来");
+
+        // 多账号取最早恢复时刻
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("ca-a") {
+                e.until = now_ts() + 120;
+            }
+            if let Some(e) = entries.get_mut("ca-b") {
+                e.until = now_ts() + 60;
+            }
+        }
+        let (n2, until2) = pool.soft_cooldown_stats();
+        assert_eq!(n2, 2, "两个账号软冷却应计 2 个");
+        assert!(until2.is_some_and(|t| t <= now_ts() + 61), "应取最早恢复时刻");
+
+        // 硬冷却（积分耗尽）账号不计入软冷却——两者的恢复语义不同
+        pool.note_error("ca-c", ErrKind::HardCredit);
+        let (n3, _) = pool.soft_cooldown_stats();
+        assert_eq!(n3, 2, "hard_credit 账号不计入软冷却统计");
+
+        // 禁用账号不计入：需重新登录，与限流退避无关
+        {
+            let mut entries = safe_lock(&pool.entries);
+            if let Some(e) = entries.get_mut("ca-b") {
+                e.disabled = true;
+            }
+        }
+        let (n4, _) = pool.soft_cooldown_stats();
+        assert_eq!(n4, 1, "禁用账号不计入软冷却统计");
+    }
+
+    // ==================== F-80：冷却/禁用标记落 app.log ====================
     #[test]
     fn cooldown_event_logged_when_ctx_assembled() {
         let dir = std::env::temp_dir().join(format!("aiwa_f80_on_{}", std::process::id()));

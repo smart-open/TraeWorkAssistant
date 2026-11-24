@@ -994,6 +994,39 @@ pub struct ApiPoolFile {
     /// 上游活动结束后关闭即恢复官方同步倍率
     #[serde(default = "default_true")]
     pub qoder_flash_free_rate: bool,
+    // ── CodeArts（华为云码道）独立池配置（阶段2）────────────────────────────
+    /// CodeArts 上游开关（默认关，资源调度页显式开启）
+    #[serde(default)]
+    pub codearts_enabled: bool,
+    /// CodeArts 池调度策略（空 = 跟随 Trae 池）
+    #[serde(default)]
+    pub codearts_strategy: String,
+    /// CodeArts 池入池白名单（ca- 前缀账号 id）；空 = 全部含凭证账号入池
+    #[serde(default)]
+    pub codearts_enabled_uids: Vec<String>,
+    /// CodeArts 池分组筛选（共享分组体系）；空 = 不限分组
+    #[serde(default)]
+    pub codearts_group_ids: Vec<String>,
+    /// CodeArts 池标签筛选；空 = 不限
+    #[serde(default)]
+    pub codearts_tag_ids: Vec<String>,
+    /// CodeArts 慢请求竞速对冲阈值毫秒（0 = 关闭；预留）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub codearts_hedge_threshold_ms: u64,
+    /// CodeArts 会话粘性开关（默认开）：同一对话绑定同一账号，保住上游
+    /// prompt cache。CodeArts 每轮都把完整历史重新 prefill（实测单账号 40 万
+    /// token/轮），多账号池下不粘性 = 每轮换号 = 缓存全 miss。
+    #[serde(default = "default_codearts_sticky_enabled")]
+    pub codearts_sticky_enabled: bool,
+    /// CodeArts 池账号并发上限（默认 3 = 上游每账号会话名额数；0 = 不限）
+    #[serde(default = "default_codearts_concurrency_limit")]
+    pub codearts_account_concurrency_limit: u32,
+    /// CodeArts 池粘性 TTL 秒（默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub codearts_pool_sticky_ttl_secs: u64,
+    /// CodeArts 显式会话粘性 TTL 秒（默认 1800；预留）
+    #[serde(default = "default_sticky_ttl_secs")]
+    pub codearts_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -1004,6 +1037,24 @@ fn default_hedge_threshold_ms() -> u64 {
 
 fn default_account_concurrency_limit() -> u32 {
     1
+}
+
+/// CodeArts 池账号并发上限默认值：**必须与上游会话名额一致（3）**。
+///
+/// 码道单账号硬性只给 3 个并发会话名额（见 `codearts_route` 的会话登记协议），
+/// 本地上限设得比它低是纯浪费（明明还有名额却不发请求），设得比它高则必然
+/// 换来 `TM.00001041`——而 1041 在成规模的池上会连带惩罚账号。故默认对齐 3。
+fn default_codearts_concurrency_limit() -> u32 {
+    3
+}
+
+/// CodeArts 会话粘性默认值：开。
+///
+/// 同一对话绑定同一账号才能吃到上游 prompt cache。CodeArts 每轮都把完整历史
+/// 重新 prefill（实测单账号约 40 万 token/轮），多账号池下不粘性 = 每轮换号
+/// = 缓存全 miss，既烧额度也把上游令牌桶推高。
+fn default_codearts_sticky_enabled() -> bool {
+    true
 }
 
 fn default_pool_sticky_ttl_secs() -> u64 {
@@ -1078,6 +1129,16 @@ impl Default for ApiPoolFile {
             pseudo_keepalive_secs: default_pseudo_keepalive_secs(),
             wb_retry_budget: 0,
             buddy_ai_retry_budget: 0,
+            codearts_enabled: false,
+            codearts_strategy: String::new(),
+            codearts_enabled_uids: Vec::new(),
+            codearts_group_ids: Vec::new(),
+            codearts_tag_ids: Vec::new(),
+            codearts_hedge_threshold_ms: default_hedge_threshold_ms(),
+            codearts_sticky_enabled: default_codearts_sticky_enabled(),
+            codearts_account_concurrency_limit: default_codearts_concurrency_limit(),
+            codearts_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
+            codearts_sticky_ttl_secs: default_sticky_ttl_secs(),
         }
     }
 }

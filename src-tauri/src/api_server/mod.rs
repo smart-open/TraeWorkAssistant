@@ -1,6 +1,7 @@
 pub mod api_keys;
 pub mod api_logger;
 pub mod auth;
+pub mod codearts_route;
 pub mod config_cache;
 pub mod context_window;
 pub mod custom_lb;
@@ -191,6 +192,25 @@ pub struct ApiSharedState {
     /// 工具别名正向改写、响应侧逆映射回改；与 Trae 池 wb_sanitize 独立（池级
     /// 风控画像不同，分开治理），UI「指纹清洗」tab 池级开关热切换
     pub qoder_sanitize: std::sync::atomic::AtomicBool,
+    // ── CodeArts 上游（华为云码道，snap-access 推理网关；AK/SK 签名）─────────
+    /// CodeArts 上游账号池：独立池实例与 SOLO/WB/Qoder 并列；池内仅存账号快照
+    /// （jwt 槽位留空），AK/SK 真凭证由 codearts_identity 回调按需解析
+    pub codearts_pool: ApiPool,
+    /// CodeArts 上游开关（api_pool.json.codearts_enabled；默认关，资源调度页显式开启）
+    pub codearts_enabled: std::sync::atomic::AtomicBool,
+    /// CodeArts 凭证解析回调：入参账号 id，返回 AK/SK（vault 解密，内存签名，零明文日志）
+    pub codearts_identity:
+        Option<Arc<dyn Fn(&str) -> Result<crate::tasks::codearts_common::CodeartsCreds, String> + Send + Sync>>,
+    /// CodeArts 慢请求竞速对冲阈值毫秒（0 = 关闭；预留，精简版未接线对冲）
+    pub codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// CodeArts 会话粘性开关（默认关；预留，精简版未接线显式粘性）
+    pub codearts_sticky_enabled: std::sync::atomic::AtomicBool,
+    /// CodeArts 会话粘性存储（"c:" 命名空间，与 wb/qoder 互不串绑）
+    pub codearts_sticky: wb_sticky::StickyStore,
+    /// CodeArts 池粘性 TTL 秒（默认 300，per-pool）
+    pub codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// CodeArts 指纹清洗开关（预留，精简版不消费）
+    pub codearts_sanitize: std::sync::atomic::AtomicBool,
     // ── Buddy 国际版（buddy-ai）独立池（§3.4 隔离清单）─────────────────────
     /// buddy-ai 上游账号池：与 wb 池并列的独立池实例（§3.1 硬约束 1：禁止混居；
     /// 阶段 1 仅注册 + healthz selectable，dispatch 接线在阶段 2）
@@ -274,6 +294,14 @@ pub(crate) fn test_shared_state(data_dir: std::path::PathBuf) -> ApiSharedState 
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
         qoder_sticky: wb_sticky::StickyStore::default(),
         qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
+        codearts_pool: pool::ApiPool::new(),
+        codearts_enabled: std::sync::atomic::AtomicBool::new(false),
+        codearts_identity: None,
+        codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+        codearts_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+        codearts_sticky: wb_sticky::StickyStore::default(),
+        codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+        codearts_sanitize: std::sync::atomic::AtomicBool::new(true),
         trae_sticky: wb_sticky::StickyStore::default(),
         buddy_ai_pool: pool::ApiPool::new(),
         buddy_ai_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -545,6 +573,52 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Qoder, day));
+    }
+
+    /// 记录一次 CodeArts 上游请求用量（独立 codearts_days 桶，与 Trae/WB/Qoder
+    /// 侧分账）；uid 为 CodeArts 账号 id，落盘策略与 record_usage 相同。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_codearts(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        ttfb_ms: Option<u64>,
+        session: &usage::CodeartsSessionCtx,
+    ) {
+        let day = usage::today_key();
+        let mut guard = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        guard.record_in_ttfb_on(
+            usage::UsageBucket::CodeArts,
+            &day, model, uid, key_id, ok, is_stream, duration_ms,
+            prompt_tokens, completion_tokens, ttfb_ms,
+        );
+        drop(guard);
+        // 请求级流水：同步直写（幂等 UPSERT；写失败静默，不影响记账主路径）
+        let _ = crate::store::docs::codearts_session_insert(
+            &crate::store::db(&self.data_dir),
+            &session.request_id,
+            &session.session_id,
+            uid,
+            &day,
+            session.ts,
+            model,
+            prompt_tokens as i64,
+            completion_tokens as i64,
+            duration_ms as i64,
+            is_stream,
+            ok,
+            &session.preview,
+        );
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((usage::UsageBucket::CodeArts, day));
     }
 
     /// 排空用量脏队列并落盘（flusher 线程 2s 一次 + stop 时调用）。
@@ -1095,6 +1169,14 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             qoder_sanitize: std::sync::atomic::AtomicBool::new(true),
+            codearts_pool: pool::ApiPool::new(),
+            codearts_enabled: std::sync::atomic::AtomicBool::new(false),
+            codearts_identity: None,
+            codearts_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            codearts_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            codearts_sticky: wb_sticky::StickyStore::default(),
+            codearts_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            codearts_sanitize: std::sync::atomic::AtomicBool::new(true),
             trae_sticky: wb_sticky::StickyStore::default(),
             buddy_ai_sticky: wb_sticky::StickyStore::default(),
             buddy_ai_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),

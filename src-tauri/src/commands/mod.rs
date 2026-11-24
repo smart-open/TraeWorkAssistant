@@ -3,6 +3,7 @@ pub mod api_server;
 pub mod cert;
 pub mod ccswitch;
 pub mod checkin;
+pub mod codearts;
 pub mod custom;
 pub mod doubao;
 pub mod env;

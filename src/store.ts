@@ -19,6 +19,8 @@ import type {
   ProxyStatus,
   QoderCheckinDone,
   QoderCheckinLine,
+  CodeartsCheckinDone,
+  CodeartsCheckinLine,
   Settings,
   ViewKey,
   AppKey,
@@ -61,6 +63,13 @@ export interface QoderCheckinState {
   doneRev: number;
 }
 
+/** CodeArts 签到进行态（与 QoderCheckinState 同构：store 单例持有，事件监听在
+ *  store 层注册，页面切走/卸载不丢事件；调度器后台触发亦不丢） */
+export type CodeartsCheckinState = Omit<QoderCheckinState, 'lines' | 'done'> & {
+  lines: CodeartsCheckinLine[];
+  done: CodeartsCheckinDone | null;
+};
+
 export interface LogQuery {
   logType?: string;
   date?: string;
@@ -99,6 +108,8 @@ interface AppState {
   checkin: CheckinState;
   /** Qoder 签到进行态（疑点⑦：store 单例持有，页面切走不丢事件） */
   qoderCheckin: QoderCheckinState;
+  /** CodeArts 签到进行态（store 单例持有，页面切走不丢事件） */
+  codeartsCheckin: CodeartsCheckinState;
   toasts: Toast[];
   profiles: ProfileInfo[];
   profileProgress: string[];
@@ -121,6 +132,10 @@ interface AppState {
   applyQoderCheckinLine: (line: string) => void;
   /** 发起 Qoder 签到（连点自守；失败置回 running 并 toast） */
   startQoderCheckin: () => Promise<void>;
+  /** CodeArts 签到 NDJSON 进度归约（start/done/逐账号行/exit） */
+  applyCodeartsCheckinLine: (line: string) => void;
+  /** 发起 CodeArts 签到（连点自守；失败置回 running 并 toast） */
+  startCodeartsCheckin: (opts?: { user_ids?: string[]; skip_checked_in?: boolean }) => Promise<void>;
 
   refreshEnv: () => Promise<void>;
   refreshCert: () => Promise<void>;
@@ -380,6 +395,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   deviceResetActive: false,
   checkin: { active: false, total: 0, index: 0, results: [], done: null, retry: null },
   qoderCheckin: { running: false, lines: [], done: null, doneRev: 0 },
+  codeartsCheckin: { running: false, lines: [], done: null, doneRev: 0 },
   toasts: [],
   profiles: [],
   profileProgress: [],
@@ -407,6 +423,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       },
       onCheckinProgress: (e) => get().applyCheckinEvent(e),
       onQoderCheckinProgress: (line) => get().applyQoderCheckinLine(line),
+      onCodeartsCheckinProgress: (line) => get().applyCodeartsCheckinLine(line),
       onSwitchProgress: (line) =>
         set((s) => ({ switchProgress: [...s.switchProgress.slice(-49), line] })),
       // D2：订阅后端 switch-done，给用户明确的切换完成/失败信号
@@ -806,6 +823,86 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  applyCodeartsCheckinLine: (line) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+    const ev = parsed as Record<string, unknown>;
+    const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+    if (ev.type === 'start') {
+      set((s) => ({ codeartsCheckin: { ...s.codeartsCheckin, running: true, lines: [], done: null } }));
+      return;
+    }
+    if (ev.type === 'done') {
+      if (ev.skipped_busy === true) {
+        set((s) => ({ codeartsCheckin: { ...s.codeartsCheckin, running: false, done: null } }));
+        get().pushToast('warn', '另一进程正在执行 CodeArts 签到，本轮已跳过');
+        return;
+      }
+      const done: CodeartsCheckinDone = {
+        ok: num(ev.ok),
+        already: num(ev.already),
+        failed: num(ev.failed),
+        empty: num(ev.failed_empty_campaigns),
+        blocked: num(ev.failed_blocked),
+      };
+      set((s) => ({
+        codeartsCheckin: {
+          ...s.codeartsCheckin,
+          running: false,
+          done,
+          doneRev: s.codeartsCheckin.doneRev + 1,
+        },
+      }));
+      get().pushToast(
+        done.failed > 0 ? 'warn' : 'success',
+        `CodeArts 签到完成：成功 ${done.ok}，已签 ${done.already}，失败 ${done.failed}`,
+      );
+      return;
+    }
+    if (ev.type === 'exit') {
+      set((s) => ({ codeartsCheckin: { ...s.codeartsCheckin, running: false } }));
+      return;
+    }
+    if (typeof ev.index === 'number' && ev.index > 0) {
+      const i = ev.index;
+      const raw = ev.reward;
+      const reward =
+        typeof raw === 'number' && isFinite(raw)
+          ? raw
+          : typeof raw === 'string' && raw.trim() !== '' && !isNaN(Number(raw))
+            ? Number(raw)
+            : undefined;
+      set((s) => {
+        const lines = s.codeartsCheckin.lines.slice();
+        lines[i - 1] = {
+          index: i,
+          user_id: String(ev.user_id ?? ''),
+          name: String(ev.name ?? ''),
+          status: (ev.status as CodeartsCheckinLine['status']) ?? 'fail',
+          message: ev.message != null ? String(ev.message) : undefined,
+          reward,
+        };
+        return { codeartsCheckin: { ...s.codeartsCheckin, lines } };
+      });
+    }
+  },
+
+  startCodeartsCheckin: async (opts) => {
+    if (get().codeartsCheckin.running) return; // 连点自守（后端轮次锁仍兜底）
+    set((s) => ({ codeartsCheckin: { ...s.codeartsCheckin, running: true, lines: [], done: null } }));
+    try {
+      await api.codearts.checkinStart(opts ?? { skip_checked_in: true });
+    } catch (err) {
+      set((s) => ({ codeartsCheckin: { ...s.codeartsCheckin, running: false } }));
+      get().pushToast('error', `发起签到失败：${String(err)}`);
+    }
+  },
+
   refreshEnv: async () => {
     try {
       const env = await api.env.check();
@@ -865,8 +962,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // buddy-ai（国际版）不参与固定应用（脏值回退 trae，与后端 state.rs 归一口径一致）
       // 审查修复（L33）：hidden_apps 白名单对齐后端 state.rs 口径——仅 4 键且不含
       // buddy-ai（其可见性走独立 opt-in buddy_ai_visible，不进隐藏列表）
-      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
-      const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao'];
+      const validApps: AppKey[] = ['trae', 'buddy', 'qoder', 'codearts', 'doubao'];
+      const pinnableApps: AppKey[] = ['trae', 'buddy', 'qoder', 'codearts', 'doubao'];
       if (!pinnableApps.includes(settings.pinned_app as AppKey)) settings.pinned_app = 'trae';
       settings.hidden_apps = (settings.hidden_apps ?? []).filter(
         (a): a is AppKey => validApps.includes(a) && a !== settings.pinned_app,
@@ -896,7 +993,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 审查 #7 修复：图标白名单对齐后端 state.rs 口径含 buddy-ai（应用显示面板行首
       // 入口放行自定义图标；原沿用 hidden_apps 的 validApps 缺 buddy-ai，每次刷新
       // 都把 buddy-ai 自定义图标清除并随 saveSettings 写回丢失）
-      const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'doubao', 'buddy-ai'];
+      const iconApps: AppKey[] = ['trae', 'buddy', 'qoder', 'codearts', 'doubao', 'buddy-ai'];
       const cleanIcons: Partial<Record<AppKey, string>> = {};
       for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
         if (iconApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {

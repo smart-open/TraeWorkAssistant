@@ -27,7 +27,7 @@ function PoolBadges({ pools }: { pools: string[] }) {
     <>
       {pools.map((p) => {
         const label =
-          p === 'trae' ? 'Trae' : p === 'buddy' ? 'Buddy' : p === 'buddy-ai' ? 'BuddyAi' : p === 'qoder' ? 'Qoder' : '自定义';
+          p === 'trae' ? 'Trae' : p === 'buddy' ? 'Buddy' : p === 'buddy-ai' ? 'BuddyAi' : p === 'qoder' ? 'Qoder' : p === 'codearts' ? 'CodeArts' : '自定义';
         if (!isPoolVisible(settings, p)) {
           return (
             <Badge
@@ -43,7 +43,7 @@ function PoolBadges({ pools }: { pools: string[] }) {
         return (
           <Badge
             key={p}
-            tone={p === 'trae' ? 'blue' : p === 'buddy' ? 'violet' : p === 'buddy-ai' ? 'cyan' : p === 'qoder' ? 'green' : 'amber'}
+            tone={p === 'trae' ? 'blue' : p === 'buddy' ? 'violet' : p === 'buddy-ai' ? 'cyan' : p === 'qoder' ? 'green' : p === 'codearts' ? 'cyan' : 'amber'}
           >
             {label}
           </Badge>

@@ -5,7 +5,7 @@
 
 ## 1. 一句话
 
-Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到）。API 网关为 **trae / buddy / qoder / custom / buddy-ai 多池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
+Windows 桌面端多账号签到 + 登录态切换 + 设备隔离 + API 网关一站式工作台，**深度支持 Trae（Trae CN 单客户端，原 Trae Work / Trae CN IDE 双应用已官方合并）/ WorkBuddy / Qoder 三应用 + 豆包 + CodeArts（华为云码道，国内站）**（账号自动发现、切换/快照按目标应用独立、账号池 app 无关同池调度；Qoder 支持 PAT / OAuth 设备流 / IDE 登录态扫描三通道入池与每日双活动签到；CodeArts 以 AK/SK 手工录入或华为云浏览器 OAuth（PKCE+DPoP，自动续期）入池、每日签到领积分并作为网关一等资源池）。API 网关为 **trae / buddy / qoder / codearts / custom / buddy-ai 六池统一调度**（custom 为自定义上游组：组内负载均衡 + 熔断；默认候选序尾部兜底），每池独立开关。**所有数据仅存在 `%APPDATA%\AIWorkAssistant\`，零外部网络**。
 
 ## 2. Quick Start
 
@@ -75,10 +75,11 @@ ai-work-assistant/
 │       │   ├── auth.rs           # API Key 鉴权（Bearer + x-api-key 双风格）
 │       │   ├── models_sync.rs    # 模型列表配置化（api_models.json）+ 官网 batch_get_detail_param 同步
 │       │   └── api_logger.rs     # API 请求日志
-│       └── commands/             # env / cert / proxy / accounts / checkin / switch / misc / profile / api_server / oauth / trae_apps(本机 Trae 账号发现) / process(三级关闭) / updater / wb_config(wb 手工配置读写)；workbuddy/ 为目录模块（common/accounts/checkin/credits/cli/chatdata/oauth/env_reset，mod.rs pub use 保持命令路径不变）
-│       └── tasks/                # 后台业务直调模块（trae_checkin / wb_checkin / wb_common / wb_credits / doubao_session / doubao_quota / doubao_chats / ui_click）
+│       └── commands/             # env / cert / proxy / accounts / checkin / switch / misc / profile / api_server / oauth / trae_apps(本机 Trae 账号发现) / process(三级关闭) / updater / wb_config(wb 手工配置读写)；workbuddy/ 为目录模块（common/accounts/checkin/credits/cli/chatdata/oauth/env_reset，mod.rs pub use 保持命令路径不变）；codearts/ 为目录模块（AK/SK 入池 / 签到 / 积分 / 设置 / 网关池状态与用量统计）
+│       └── tasks/                # 后台业务直调模块（trae_checkin / wb_checkin / wb_common / wb_credits / doubao_session / doubao_quota / doubao_chats / codearts_checkin / codearts_credits / codearts_sign / ui_click）
 │           ├── trae_checkin.rs   # 批量签到（vault 解密内存传递，无子进程）
 │           ├── wb_checkin.rs     # WorkBuddy 签到/成长/续期（run_checkin_round / run_growth_round / run_renew_only）
+│           ├── codearts_*.rs     # CodeArts 签到（codearts_checkin）/ 积分（codearts_credits）/ 华为云 APIG SDK-HMAC-SHA256 签名（codearts_sign）
 │           └── doubao_*.rs       # 豆包会话续期 / 额度巡检 / 对话导出
 │       └── switcher/            # 登录态切换器（原 PS 桥 trae-switch-bridge.ps1 全量 Rust 化）
 │           ├── mod.rs           # run_action 入口 + 7 Action 编排 + ProgressSink（TauriSink/CliSink）
@@ -209,6 +210,16 @@ ai-work-assistant/
 | Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
 | Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认；分组定义随载荷导出，导入按 id 幂等合并 + 幽灵 group_id 回落未分组） |
 | Qoder | `qoder_env_reset_items()` / `qoder_env_reset(items)` | Qoder 环境残留清理清单 + 程序化清理（执行前关闭 Qoder IDE 与 Work 客户端——本体进程同名 "Qoder CN.exe" 一并覆盖；9 项含 QoderWork 客户端 `%APPDATA%\com.qodercn.app.stable` 的 Local State + Network\Cookies；单项失败不中断） |
+| CodeArts | `codearts_account_import_ak_sk(name?, ak, sk)` | 华为云码道（国内站）AK/SK 手工入池：以 AK/SK 为长期凭据，按 ak/sk 稳定派生账号 id；敏感字段入 vault，库内占位；入池即联动网关池热重载 |
+| CodeArts | `codearts_oauth_login()` / `codearts_oauth_cancel()` | 华为云浏览器 OAuth（PKCE S256 + ES256 DPoP）：本地回环 127.0.0.1:17389 收 code → STS `/v1/oauth2/tokens` 换临时 AK/SK+security_token+refresh_token；系统浏览器打开授权页（ShellExecuteW，不抢占窗口）；事件 `codearts-oauth-progress` / `codearts-oauth-done`；凭据入 vault，按稳定 user_id 派生 `ca-o-` id，到期前 30min 静默续期 |
+| CodeArts | `codearts_accounts_list` → `CodeartsAccountView[]` | 账号池 ∪ token store 合并视图（脱敏：AK 掩码下发、SK 不回传，只回凭据状态徽标） |
+| CodeArts | `codearts_checkin_start(opts)` → NDJSON `codearts-checkin-progress` | Rust 直调 `tasks/codearts_checkin.rs`：对 `/v1/ops/delivery` 四态预检 → `/v1/ops/claim` 领取 → 必要时 `/v1/ops/confirm` 确认；所有上游请求用 AK/SK 做 `SDK-HMAC-SHA256` 签名，幂等归类已签 |
+| CodeArts | `codearts_checkin_results(days?)` | 签到日志（codearts_checkin_results 表，90 天滚动） |
+| CodeArts | `codearts_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/codearts_credits.rs`：`GET /snap-manager/v1/statistics/plugin`（`SDK-HMAC-SHA256` 签名 + `agent-type` 头）查积分，缓存后回写账号池余额；每日签到最高 1000 积分（积分制套餐用户） |
+| CodeArts | `codearts_checkin_task_register(times[]) / _status / _unregister` | 应用内调度器每日签到任务 + schtasks 每日签到任务（主 exe `--task-run codearts-checkin`），双轨错峰执行 |
+| CodeArts | `codearts_settings_get()` / `codearts_settings_set(patch)` | kv("codearts_settings")：auto_checkin（启动补签）/ checkin_hhmm / 网关上游开关等（snake_case） |
+| CodeArts | `codearts_pool_status()` | 网关 CodeArts 池运行状态：账号数 / 健康态 / 模型级冷却 / 上游连通性（对齐 buddy/qoder 池状态口径） |
+| CodeArts | `api_codearts_usage_stats(days?)` | 网关用量统计独立 `UsageBucket::CodeArts` 桶按日查询（days 默认 14 clamp 1~90），与其他池分桶入库 |
 
 ### 5.1 Trae 账号发现与双 uid 体系（F-08，trae_apps.rs；双应用合并适配 2026-10-14）
 
@@ -232,8 +243,8 @@ ai-work-assistant/
 
 ### 5.3 多池调度与统一模型目录（v3.3.x；2026-10-22 custom 上游组改造）
 
-- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai，按账号 domain 判定）/ `qoder` / `buddy-ai` / `custom`（自定义 OpenAI 兼容上游组 `custom_models.json`，同名多条 = 上游组；v3 起为第五资源池参与统一调度，**默认候选序尾部兜底**，纯 custom 模型唯一源直达）。协议细节见 tech-framework.md §5.5 与附录 B。
-- **池间策略（`dispatch.rs`）**：`smart` 默认——按请求模型对可用源池排序：① 池内最早积分到期优先（无到期数据后置）→ ② 该模型倍率小者优先（0=免费最优；custom 取组内最小 rate）→ ③ 健康账号剩余积分总和多优先（custom 后置）；全并列回退固定序（Buddy 优先现状）。`priority` 为严格按序行为。`per_model` 显式覆盖不做智能重排（用户显式配置优先，值可写 `"custom"` 任意位置）；`fallback=false` 时仅用首选池。默认候选序 = `[buddy, trae, qoder, custom]`（priority 缺省不含 custom，尾部补全循环追加）。
+- **资源池**：`trae`（SOLO `llm_utils_chat`，积分 208）/ `buddy`（copilot.tencent.com 或 www.workbuddy.ai，按账号 domain 判定）/ `qoder` / `buddy-ai` / `custom`（自定义 OpenAI 兼容上游组 `custom_models.json`，同名多条 = 上游组；v3 起为第五资源池参与统一调度，**默认候选序尾部兜底**，纯 custom 模型唯一源直达）/ `codearts`（华为云码道国内站，AK/SK 入池、上游 `SDK-HMAC-SHA256` 签名，**第六资源池**参与统一调度，与其余池同款开关 / 调度参数 / 用量分桶）。协议细节见 tech-framework.md §5.5 与附录 B。
+- **池间策略（`dispatch.rs`）**：`smart` 默认——按请求模型对可用源池排序：① 池内最早积分到期优先（无到期数据后置）→ ② 该模型倍率小者优先（0=免费最优；custom 取组内最小 rate）→ ③ 健康账号剩余积分总和多优先（custom 后置）；全并列回退固定序（Buddy 优先现状）。`priority` 为严格按序行为。`per_model` 显式覆盖不做智能重排（用户显式配置优先，值可写 `"custom"` 任意位置）；`fallback=false` 时仅用首选池。默认候选序 = `[buddy, trae, qoder, codearts, custom]`（priority 缺省不含 custom，尾部补全循环追加）。
 - **统一目录（`unified_catalog.rs`）**：`api_unified_models` 与 `GET /v1/models` 共用；Trae 模型元数据四层兜底——L1 人工覆盖（`trae_model_meta.json`，编辑弹框 upsert/clear）→ L2 官网同步 → L3 默认 128K / 倍率参考（含 2026-09-13 审查补充的 5 个官网同步缺失倍率）→ L4 系列/思考档位/图片支持推断。倍率口径冲突时只补缺失条目、不改既有值。同名多条 custom 条目聚合为单行（倍率取组内最小，任一条 enabled 即可命中）。
 - **custom 上游组（`custom_route.rs` / `custom_models.rs` / `custom_lb.rs`）**：请求模型名 canonical（trim+lowercase）命中上游组（全部 enabled 条目）；组内 `pick_upstream` 加权轮询选路（粘性优先，TTL 60s；standby 备胎仅在活跃条目全失败/全熔断时启用），所选上游失败且未向客户端产出字节（`!sent_any`）时换组内下一上游重试（≤ min(N,3) 轮），`sent_any` 后就地收尾（SSE 铁律）。专用 agent 连接超时 3s（快速失败）/首字 10s/空闲读 300s；请求体每次 attempt 按所选条目重建（模型名对齐条目 name 原文）。实例级熔断（custom_lb）键 = cm.id：Server 类渐进冷却 30s×2ⁿ 封顶 480s（递增条件 = 既有窗口已过期，防单请求轮换放大），401/403/402 直接 600s 长窗；成功即清、重启清零；半开 = 窗口到期后下一请求自然放行，探测失败由组内轮换立即兜底客户端无感。custom 全熔断 → `NoHealthy(Custom)` → 现有 fallback 按序回退下一池。
 
