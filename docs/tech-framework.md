@@ -245,6 +245,19 @@ Store         store/（SQLite 存储层——全量状态库 aiwork.sqlite：kv 
 - 对话 `POST /api/v2/chat/completions`；活动列表/状态 `GET /v1/ops/delivery`（四态预检，唯一真相源）→ 领取 `POST /v1/ops/claim` → 必要时 `POST /v1/ops/confirm`；模型目录 `GET /v1/model/builtin`；积分统计 `GET /snap-manager/v1/statistics/plugin`。
 - `codearts_checkin_start` → `tasks/codearts_checkin.rs` 幂等签到；`codearts_checkin_results` 落 codearts_checkin_results 表（90 天滚动）；`codearts_credits_fetch` → `tasks/codearts_credits.rs` 查积分并回写余额，每日签到最高 1000 积分（积分制套餐用户），落 codearts_credits_history 表（365 天）；`codearts_checkin_task_register(times[])` 每日签到任务（应用内调度器 + schtasks `--task-run codearts-checkin` 双轨）；`codearts_settings_get/set` 管理开关与时刻；`codearts_pool_status` / `api_codearts_usage_stats` 透出池状态与独立用量桶 `UsageBucket::CodeArts`。
 
+**网关执行层（`api_server/codearts_route.rs`）**
+
+- **会话名额登记协议**：上游的并发上限不吃「HTTP 请求结束」，认的是一套显式会话登记 —— `PUT /snap-manager/v1/chat-session/heartbeat?status=busy` 带 `user-session-id` 头登记名额，推理请求带同一 id，请求结束再 `?status=idle` 注销。单账号 **3 个名额**，未登记的请求上游会各自新开会话且永不回收（只按超时回收）。`SessionSlot` 用 RAII 保证登记/注销配对，注销失败落 app.log（名额泄漏会让后续请求持续撞 `TM.00001041`）。
+- **名额与亲和分离**：名额 id 每请求新建（idle 是注销语义，复用会踢掉他人会话）；`x-session-affinity` 按对话稳定（`SessionKey` 指纹或显式 `conversation_id` 摘要），用于上游会话粘性路由与 prompt cache。
+- **错误归因口径**（`codearts_failure`）：
+  - 并发名额满 `TM.00001041` → 429 + `SoftRate`，但冷却时长走独立的 `CONCURRENCY_FULL_COOLDOWN_SECS`（3s）；同时补一次 idle 回收。**这是容量信号不是速率信号**，用分钟级窗口会让账号被冻结、换号失效。
+  - 令牌桶限流 `ModelArts.81114.429` / `002002010.429` → 429 + `SoftRate`，账号侧按文案粒度冷却（分钟桶对齐下一自然分钟 + 3s），模型表只落 `RATE_LIMIT_SOFT_HINT_SECS`（3s）软提示；**池内轮换全部因限流失败**才升级为 `QUEUE_BACKOFF_MAX_SECS` 模型级冷却（`escalate_rate_limit_if_exhausted`）。
+  - 排队码 `TM.00001045` / `TM.000010051` → 429 不罚账号，同号退避重发（`QUEUE_RETRY_LIMIT` 3 次 / `QUEUE_BUDGET_SECS` 45s），等待期间先归还会话名额。
+  - 请求级错误（参数 / role / 非多模态 / 内容审核 / 模型未注册）→ 不冷却账号；本机网络故障 → 503 不污染账号与模型表。
+- **并发上限与调度**：`codearts_account_concurrency_limit` 默认 3（与上游名额一致）；CodeArts 不做 `over_limit` 无条件放行（上游有硬上限，超配只会换来 1041），一律由 `bind_account_cas` 复核，名额满则换号。模型级冷却在执行路径前置早退，不再逐账号硬打整池。
+- **耗时可观测**：池耗尽收尾在错误消息中附 `tried_accounts=N/账号名…`（区分「单账号上游错误」与「整池轮换耗尽」）；对冲为 `[SCHED] hedge_spawn` / `hedge_skip reason=no_second_account|hedge_busy` 明细。
+- **默认值**：`codearts_sticky_enabled` 默认开（同一对话绑同一账号，CodeArts 每轮全量 prefill，不粘性等于每轮缓存全 miss）。
+
 ## 6. 附录 A：Trae API 协议参考（抓包实证）
 
 > 完整抓包过程记录见 git 历史（原 api-credit-analysis.md，2026-08-14 归档）。此处保留开发必需的协议事实。

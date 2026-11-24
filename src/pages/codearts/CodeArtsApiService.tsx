@@ -31,8 +31,8 @@ export default function CodeArtsApiService() {
 
   const [enabled, setEnabled] = useState(false);
   const [hedgeMs, setHedgeMs] = useState(8000);
-  const [stickyEnabled, setStickyEnabled] = useState(false);
-  const [concurrency, setConcurrency] = useState(1);
+  const [stickyEnabled, setStickyEnabled] = useState(true);
+  const [concurrency, setConcurrency] = useState(3);
   const [poolStickyTtl, setPoolStickyTtl] = useState(300);
   const [stickyTtl, setStickyTtl] = useState(1800);
   const [strategy, setStrategy] = useState('');
@@ -57,8 +57,10 @@ export default function CodeArtsApiService() {
       if (pf) {
         setEnabled(pf.codearts_enabled ?? false);
         setHedgeMs(pf.codearts_hedge_threshold_ms ?? 8000);
-        setStickyEnabled(pf.codearts_sticky_enabled ?? false);
-        setConcurrency(pf.codearts_account_concurrency_limit ?? 1);
+        // 回退值与后端 serde 默认一致：粘性默认开（保上游 prompt cache），
+        // 并发上限默认 3（= 码道每账号会话名额数）
+        setStickyEnabled(pf.codearts_sticky_enabled ?? true);
+        setConcurrency(pf.codearts_account_concurrency_limit ?? 3);
         setPoolStickyTtl(pf.codearts_pool_sticky_ttl_secs ?? 300);
         setStickyTtl(pf.codearts_sticky_ttl_secs ?? 1800);
         setStrategy(pf.codearts_strategy ?? '');
@@ -189,7 +191,7 @@ export default function CodeArtsApiService() {
             <input className={inputCls} value={strategy} onChange={(e) => setStrategy(e.target.value)} placeholder="如 expire_first" />
           </label>
           <label className="flex flex-col gap-1 text-xs text-slate-500">
-            账号并发上限（0 = 不限）
+            账号并发上限（0 = 不限；码道每账号名额为 3）
             <input type="number" min={0} className={inputCls} value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))} />
           </label>
           <label className="flex flex-col gap-1 text-xs text-slate-500">

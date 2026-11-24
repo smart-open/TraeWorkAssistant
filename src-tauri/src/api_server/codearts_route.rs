@@ -102,6 +102,9 @@ pub fn affinity_of(body: &Value) -> String {
 struct SessionSlot {
     identity: CodeartsIdentity,
     session_id: String,
+    /// 留痕用（Drop 里写 app.log 需要）——注销失败直接决定并发槽会不会泄漏，
+    /// 必须能在日志里查到
+    data_dir: std::path::PathBuf,
 }
 
 impl SessionSlot {
@@ -120,18 +123,46 @@ impl SessionSlot {
             );
             return None;
         }
-        Some(Self { identity: identity.clone(), session_id })
+        Some(Self { identity: identity.clone(), session_id, data_dir: data_dir.to_path_buf() })
     }
 
     fn id(&self) -> &str {
         &self.session_id
     }
+
+    /// 名额泄漏自愈：撞到「并发会话数已达上限」时立刻注销本名额。
+    ///
+    /// 上游名额只按超时回收，本地任何一次漏发的 idle（进程异常退出、队列重试
+    /// 期间 drop 与 acquire 之间断连）都会吃掉一个槽位，表现为「这个账号明明
+    /// 没在跑请求却一直 1041」。
+    ///
+    /// 这里注销的是**本请求自己的名额**（idle 是注销语义，拿别人的 id 去注销
+    /// 会踢掉用户正在用的会话），对上游幂等。消费 `self`：注销后名额已归还，
+    /// 不能再让 `Drop` 补发一次。
+    fn reclaim(self) {
+        let (ok, detail) = send_heartbeat(&self.identity, &self.session_id, "idle");
+        if !ok {
+            crate::fs_utils::app_log(
+                &self.data_dir,
+                &format!("codearts 名额回收失败（并发满时补注销 idle）: {detail}"),
+            );
+        }
+        // 名额已归还，阻止 Drop 重复注销
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for SessionSlot {
     fn drop(&mut self) {
-        // 注销失败只能尽力而为：名额最终会被上游按超时回收
-        let (_ok, _detail) = send_heartbeat(&self.identity, &self.session_id, "idle");
+        // 注销失败必须留痕：名额最终会被上游按超时回收，但那段时间里该账号少
+        // 一个并发槽——静默丢弃会让「跑几十轮后突然全撞 1041」彻底无从归因。
+        let (ok, detail) = send_heartbeat(&self.identity, &self.session_id, "idle");
+        if !ok {
+            crate::fs_utils::app_log(
+                &self.data_dir,
+                &format!("codearts 会话注销失败（该账号将少一个并发槽，等待上游超时回收）: {detail}"),
+            );
+        }
     }
 }
 
@@ -412,6 +443,27 @@ fn is_concurrency_full(text: &str) -> bool {
         || text.contains("并发会话数已达上限")
 }
 
+/// 并发名额满时的让位冷却（秒）。
+///
+/// 这是**容量信号**而不是速率信号：名额计数的是「本账号在途会话条数」，
+/// 会话一结束名额立刻回吐，可恢复时间尺度是秒级甚至更短。
+///
+/// 为什么不能沿用 `SoftRate` 的 60s：多账号池上，一次 `1041` 就把该账号冻结
+/// 一分钟，池内剩下的账号很快被同一条 `1041` 逐个带走（实测 4 个健康账号在
+/// 12 秒内全被打冷，客户端连续重试 5 次全部 429）。60s 的代价是**换号这条路
+/// 被自己堵死**——账号冻结着，换回来也用不了。
+///
+/// 取 3s：足够让本请求换号后不再立刻撞回同一账号，也短到不会让池容量塌陷。
+const CONCURRENCY_FULL_COOLDOWN_SECS: i64 = 3;
+
+/// 令牌桶限流（81114 族）在**模型表**上的软提示窗口（秒）。
+///
+/// 多账号池上一次撞桶不能推断「整个模型都满了」——其余账号的桶可能是空的。
+/// 因此它对模型表只落一个短窗：够本请求换号重试，不冻结全池。真正升级为
+/// 模型级冷却只在「池内账号轮换全部因限流失败」时发生（见 `run_codearts_stream`
+/// 与 `codearts_aggregate_chat` 的耗尽收尾）。
+const RATE_LIMIT_SOFT_HINT_SECS: u64 = 3;
+
 /// 上游令牌桶限流（账号级速率上限，如 `InferHub.ModelArts.81114.429`）：
 /// 与「并发会话数超限」是两回事——前者是**令牌/分钟速率**被打满，后者是
 /// **在途会话条数**超限。两者都是短退避即可的瞬时限流，但归因文案不同，
@@ -623,6 +675,10 @@ pub(crate) fn codearts_failure(status: u16, text: &str) -> (u16, ErrKind) {
         return (429, ErrKind::None);
     }
     if is_concurrency_full(text) {
+        // 并发名额满 = 容量信号，不是速率信号：独立归因（kind 仍为 SoftRate，
+        // 因为它确实要短暂让位，但冷却时长由 CONCURRENCY_FULL_COOLDOWN_SECS
+        // 决定，见 note_failure）。绝不能让 rate_limit_cooldown_secs 的分钟级
+        // 窗口吃掉它。
         return (429, ErrKind::SoftRate);
     }
     if is_rate_limited(text) {
@@ -738,11 +794,37 @@ fn note_model_busy(model: &str, secs: u64) {
         .or_insert_with(|| (until, 0));
 }
 
+/// 池耗尽时的限流升级：仅当本次轮换中确有账号因令牌桶限流失败，才把 81114
+/// 从「短窗软提示」升级为「全局模型冷却」。
+///
+/// 单次撞桶不足以判模型满（多账号池其余账号的桶可能是空的），但**池内轮换
+/// 全部因限流失败**就足以判定这是模型/租户级现象 —— 此时才冻结模型，让
+/// dispatch 预检在下一个请求直接回退到其他池，而不是每请求把整池再打一遍。
+///
+/// `rate_limited_hits`：本轮因 `is_rate_limited` 失败且非排队的账号次数。
+fn escalate_rate_limit_if_exhausted(model: &str, rate_limited_hits: u32) {
+    if rate_limited_hits == 0 {
+        return;
+    }
+    note_model_busy(model, QUEUE_BACKOFF_MAX_SECS);
+}
+
+/// 池耗尽收尾的可观测明细：本轮试过哪些账号、各自最后一次失败是什么。
+///
+/// 此前耗尽行只上报 `last_err`（最后一条上游原文），日志里看着像单个账号的
+/// 上游错误，实际是「整池轮换耗尽」——恰是最需要定位的时刻却定位不到。
+fn tried_note(attempted: &[String]) -> String {
+    if attempted.is_empty() {
+        return String::new();
+    }
+    format!(" tried_accounts={}/{}", attempted.len(), attempted.join(","))
+}
+
 /// 按归因结果记账：账号级冷却 + 模型级冷却（Server 渐进 / 模型繁忙短窗）。
 /// 集中一处，避免流内错误/HTTP 错误/聚合三条路径口径漂移。
 ///
-/// `upstream_text`：上游错误原文，用于按限流粒度算冷却时长（令牌桶按分钟
-/// 窗口重置，固定 60s 会白等或早放行）。None = 走该错误类的默认时长。
+/// `upstream_text`：上游错误原文，用于按信号粒度算冷却时长（令牌桶按分钟
+/// 窗口重置、并发名额按会话释放）。None = 走该错误类的默认时长。
 fn note_failure(
     state: &ApiSharedState,
     model: &str,
@@ -750,12 +832,33 @@ fn note_failure(
     kind: ErrKind,
     upstream_text: Option<&str>,
 ) {
+    // 并发名额满：**容量信号**，绝不当速率信号处理。
+    // 不写模型表（名额是账号属性，同模型换个账号就有名额），账号侧只做极短
+    // 让位冷却——冻结一分钟会让换号这条路失效，多账号池会在十几秒内被同一条
+    // 1041 逐个打冷。
+    let concurrency_full = upstream_text.is_some_and(is_concurrency_full);
+    if concurrency_full {
+        state.codearts_pool.note_error_until(
+            uid,
+            ErrKind::SoftRate,
+            Some(now_ts() + CONCURRENCY_FULL_COOLDOWN_SECS),
+        );
+        return;
+    }
     // 模型繁忙（排队/限流族）：无论账号侧怎么处置，都要记一笔模型冷却——
     // 它是模型属性，换账号不会好转。放在账号处置之前，保证 ErrKind::None
     // （排队码不走账号冷却）也能落到模型表。
+    //
+    // 81114（共享令牌桶）与纯排队码的差别：前者在**多账号**池上未必是模型
+    // 属性——一次撞桶不代表其余账号的桶也满了。故它对模型表只做**短窗软提示**
+    // （换号重试的时间预算），真正升级为全局模型冷却由池耗尽时统一判定。
     if let Some(text) = upstream_text {
         if is_model_busy(text) {
-            let secs = rate_limit_cooldown_secs(text).max(1) as u64;
+            let secs = if is_rate_limited(text) && !is_queue_code(text) {
+                RATE_LIMIT_SOFT_HINT_SECS
+            } else {
+                rate_limit_cooldown_secs(text).max(1) as u64
+            };
             note_model_busy(model, secs);
         }
     }
@@ -763,7 +866,7 @@ fn note_failure(
         return;
     }
     if kind == ErrKind::SoftRate {
-        // 限流冷却时长按上游文案粒度算（令牌桶按分钟窗口）；无文案则用默认 60s
+        // 令牌桶限流冷却时长按上游文案粒度算（按分钟窗口重置）；无文案用默认 60s
         let secs = upstream_text.map(rate_limit_cooldown_secs).unwrap_or(60);
         state.codearts_pool.note_error_until(
             uid,
@@ -841,20 +944,45 @@ fn race_codearts_first_byte(
     let data_dir2 = state.data_dir.clone();
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, CodeArtsHedgeLease)> {
         // 取第二账号（主账号在 inflight 中，pick_excluding 自然排除）
-        let picked = state2.codearts_pool.pick_excluding_constrained(
+        let picked = match state2.codearts_pool.pick_excluding_constrained(
             &[primary_uid.to_string()].into_iter().collect(), None, None,
-        )?;
+        ) {
+            Some(p) => p,
+            None => {
+                // 无第二候选：对标 [SCHED] 落一行，避免「对冲没发生」完全不可见
+                state2.logger.log_sched_event(&format!(
+                    "hedge_skip primary={} reason=no_second_account",
+                    primary_uid
+                ));
+                return None;
+            }
+        };
+        // 并发名额复核（TOCTOU 收紧）：取号快照到此刻可能已有别的请求占满名额。
+        // 不复核就 fetch_add 会直接突破上游硬上限（每账号 3 个），换来一条
+        // TM.00001041 反而更糟——拒绝本次对冲，退回主请求纯首字超时路径。
+        let limit = state2.codearts_pool.concurrency_limit();
+        let counter = state2.codearts_pool.inflight_handle(&picked.uid);
+        let inflight = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if limit > 0 && inflight >= limit {
+            state2.logger.log_sched_event(&format!(
+                "hedge_skip primary={} hedge={} reason=hedge_busy inflight={inflight} limit={limit}",
+                primary_uid, picked.uid
+            ));
+            return None;
+        }
         // 对冲账号的 AK/SK 按 uid 重新解析（不能复用主账号的 identity）
         let hedge_identity = identity_of(&state2, &picked.uid).ok()?;
         // 会话名额：对冲独有，绝不复用主请求的 session_id
         let slot = SessionSlot::acquire(&hedge_identity, &data_dir2)?;
-        let counter = state2.codearts_pool.inflight_handle(&picked.uid);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 建连失败时租约随闭包局部变量 Drop（计数 -1 + slot idle）
         let reader = send_signed_request(
             &codearts_agent(), &hedge_identity, &body2, Some(slot.id()), Some(&affinity2),
         )
         .ok()?;
+        state2.logger.log_sched_event(&format!(
+            "hedge_spawn primary={} hedge={}", primary_uid, picked.uid
+        ));
         Some((reader, CodeArtsHedgeLease {
             uid: picked.uid, counter, _slot: slot,
         }))
@@ -1038,6 +1166,11 @@ pub(crate) fn run_codearts_stream(
         None
     };
     let mut tried: HashSet<String> = HashSet::new();
+    // 汇总账：本轮轮换实际失败过的账号名（耗尽日志用，见 tried_note）
+    let mut attempted: Vec<String> = Vec::new();
+    // 本轮因令牌桶限流（81114 族，非排队）失败的账号次数——池耗尽时才据此
+    // 把「短窗软提示」升级为「全局模型冷却」
+    let mut rate_limited_hits: u32 = 0;
     // 每账号同号重试计数（retry_plan 的 attempt 入参，控制退避轮次上限）
     let mut attempts: HashMap<String, u32> = HashMap::new();
     let mut last_err = String::from("CodeArts 池无可用账号");
@@ -1063,21 +1196,46 @@ pub(crate) fn run_codearts_stream(
             &tried, allowed.as_ref(), dedicated.as_deref(),
         ));
         let Some(picked) = picked else {
+            // 池耗尽：此前只上报 last_err（最后一条上游原文），日志看着像单个
+            // 账号的上游错误，实际是「整池轮换耗尽」——最需要定位的时刻反而
+            // 定位不到。补上本轮真正试过的账号名。
+            let detail = format!("{last_err}{}", tried_note(&attempted));
+            escalate_rate_limit_if_exhausted(model, rate_limited_hits);
             state.record_usage_codearts(model, "-", key_id, false, true,
                 start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
             state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
                 exhausted_status as u16, "-", start_ts.elapsed().as_millis() as u64,
-                &key_name, "", Some(&last_err));
-            send_stream_error(tx, proto, exhausted_status, &last_err);
+                &key_name, "", Some(&detail));
+            send_stream_error(tx, proto, exhausted_status, &detail);
             return;
         };
         tried.insert(picked.uid.clone());
-        // F-77 账号在途绑定（CAS 复核并发上限）
-        if !picked.over_limit {
+        // F-77 账号在途绑定（CAS 复核并发上限）。
+        //
+        // CodeArts **不做 over_limit 无条件放行**：上游每账号硬性只给 3 个会话
+        // 名额，超配会直接换来一条 `TM.00001041`，比本地拒绝更糟（还会连带
+        // 惩罚账号）。故 busy 全满时由 CAS 一律拒绝，交外层换号或耗尽收尾。
+        {
             let acct = state.codearts_pool.inflight_handle(&picked.uid);
             if !guard.bind_account_cas(acct, state.codearts_pool.concurrency_limit()) {
                 continue;
             }
+        }
+        // 模型级冷却早退（对齐 qoder_route）：模型已被判定繁忙/故障时，不再
+        // 逐账号把整池硬打一遍。dispatch 预检通常已经挡住，但执行期跨池移交与
+        // 并发请求仍可能进到这里——每次硬打都要付一次上游往返 + 会话名额，
+        // 换号对模型级现象也无效。
+        if let Some(remain) = model_cooling_remaining_secs(model) {
+            let msg = format!(
+                "upstream 429 error: model {model} cooling down, retry after {remain}s（模型级繁忙/故障冷却中，换号无效）"
+            );
+            state.record_usage_codearts(model, "-", key_id, false, true,
+                start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
+            state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
+                429, "-", start_ts.elapsed().as_millis() as u64, &key_name, "",
+                Some(&format!("{msg}{}", tried_note(&attempted))));
+            send_stream_error(tx, proto, 429, &msg);
+            return;
         }
         let identity = match identity_of(state, &picked.uid) {
             Ok(id) => id,
@@ -1139,8 +1297,20 @@ pub(crate) fn run_codearts_stream(
                             send_stream_error(tx, proto, client_status as i64, &msg);
                             return;
                         }
+                        // 并发名额满：先补一次 idle 回收再换号。上游名额只按超时
+                        // 回收，本地任何一次漏发的 idle 都会长期吃槽位，表现出来
+                        // 就是「这个账号没在跑请求却一直 1041」。
+                        if is_concurrency_full(&resp_body) {
+                            if let Some(s) = slot.take() {
+                                s.reclaim();
+                            }
+                        }
+                        if is_rate_limited(&resp_body) && !is_queue_code(&resp_body) {
+                            rate_limited_hits = rate_limited_hits.saturating_add(1);
+                        }
                         note_failure(state, model, &picked.uid, kind, Some(&resp_body));
                         let msg = format!("upstream status={status}");
+                        attempted.push(state.codearts_pool.name_of(&picked.uid));
                         set_last_error(state, format!("codearts uid={} model={} status={} body={}",
                             picked.uid, model, status, resp_body.chars().take(200).collect::<String>()));
                         state.logger.log_request("codearts", "POST", proto.log_path(), model, true,
@@ -1325,7 +1495,17 @@ pub(crate) fn run_codearts_stream(
                     return;
                 }
 
+                // 并发名额满：补一次 idle 回收再换号（见 SwitchKey 分支同款说明）
+                if is_concurrency_full(&detail) {
+                    if let Some(s) = slot.take() {
+                        s.reclaim();
+                    }
+                }
+                if is_rate_limited(&detail) && !is_queue_code(&detail) {
+                    rate_limited_hits = rate_limited_hits.saturating_add(1);
+                }
                 note_failure(state, model, &win_uid, kind, Some(&detail));
+                attempted.push(state.codearts_pool.name_of(&win_uid));
                 set_last_error(state, format!("codearts uid={} model={} code={} msg={}",
                     win_uid, model, code, msg));
                 // 保留真实状态码与原因，轮换耗尽时按此透传（不再一律 503）
@@ -1388,6 +1568,9 @@ pub async fn codearts_aggregate_chat(
             None
         };
         let mut tried: HashSet<String> = HashSet::new();
+        // 汇总账：本轮轮换实际失败过的账号名 + 限流失败计数（同流式口径）
+        let mut attempted: Vec<String> = Vec::new();
+        let mut rate_limited_hits: u32 = 0;
         let mut attempts: HashMap<String, u32> = HashMap::new();
         let mut last_err = String::from("CodeArts 池无可用账号");
         // 轮换耗尽时的对客户端状态码（同流式口径：优先透传真实归因）
@@ -1410,16 +1593,28 @@ pub async fn codearts_aggregate_chat(
                 &tried, allowed.as_ref(), dedicated.as_deref(),
             ));
             let Some(picked) = picked else {
+                // 池耗尽：补上本轮真正试过的账号名（同流式口径，见 tried_note）
+                escalate_rate_limit_if_exhausted(&model, rate_limited_hits);
                 state.record_usage_codearts(&model, "-", &key_id, false, stream,
                     start_ts.elapsed().as_millis() as u64, 0, 0, None, &session_ctx);
-                return Err(format!("upstream {exhausted_status} error: {last_err}"));
+                return Err(format!(
+                    "upstream {exhausted_status} error: {last_err}{}",
+                    tried_note(&attempted)
+                ));
             };
             tried.insert(picked.uid.clone());
-            if !picked.over_limit {
+            // CodeArts 不做 over_limit 无条件放行（上游每账号硬上限 3 个名额）
+            {
                 let acct = state.codearts_pool.inflight_handle(&picked.uid);
                 if !guard.bind_account_cas(acct, state.codearts_pool.concurrency_limit()) {
                     continue;
                 }
+            }
+            // 模型级冷却早退（同流式口径）
+            if let Some(remain) = model_cooling_remaining_secs(&model) {
+                return Err(format!(
+                    "upstream 429 error: model {model} cooling down, retry after {remain}s（模型级繁忙/故障冷却中，换号无效）"
+                ));
             }
             let identity = match identity_of(&state, &picked.uid) {
                 Ok(id) => id,
@@ -1472,7 +1667,17 @@ pub async fn codearts_aggregate_chat(
                                     resp_body.chars().take(200).collect::<String>()));
                                 return Err(msg);
                             }
+                            // 并发名额满：补一次 idle 回收再换号（同流式口径）
+                            if is_concurrency_full(&resp_body) {
+                                if let Some(s) = slot.take() {
+                                    s.reclaim();
+                                }
+                            }
+                            if is_rate_limited(&resp_body) && !is_queue_code(&resp_body) {
+                                rate_limited_hits = rate_limited_hits.saturating_add(1);
+                            }
                             note_failure(&state, &model, &picked.uid, kind, Some(&resp_body));
+                            attempted.push(state.codearts_pool.name_of(&picked.uid));
                             set_last_error(&state, format!("codearts uid={} model={} status={} body={}",
                                 picked.uid, model, status,
                                 resp_body.chars().take(200).collect::<String>()));
@@ -1578,7 +1783,17 @@ pub async fn codearts_aggregate_chat(
                                     "upstream 429 error: 上游模型排队中（不是登录态或额度问题），建议 {secs}s 后重试"));
                             }
 
+                            // 并发名额满：补一次 idle 回收再换号（同流式口径）
+                            if is_concurrency_full(&detail) {
+                                if let Some(s) = slot.take() {
+                                    s.reclaim();
+                                }
+                            }
+                            if is_rate_limited(&detail) && !is_queue_code(&detail) {
+                                rate_limited_hits = rate_limited_hits.saturating_add(1);
+                            }
                             note_failure(&state, &model, &picked.uid, kind, Some(&detail));
+                            attempted.push(state.codearts_pool.name_of(&picked.uid));
                             state.record_usage_codearts(&model, &picked.uid, &key_id, false, stream,
                                 duration_ms, 0, 0, None, &session_ctx);
                             set_last_error(&state, format!("codearts uid={} model={} code={} msg={}",
@@ -1789,6 +2004,86 @@ mod tests {
         note_model_failure("__other_model__");
         assert!(model_cooling_remaining_secs(m).is_none());
         clear_model_failure("__other_model__");
+    }
+
+    /// 并发名额满是**容量信号**，不是速率信号：让位冷却必须是秒级，绝不能
+    /// 落到令牌桶的分钟级窗口。
+    ///
+    /// 回归背景：多账号池上，一次 `1041` 曾把该账号冻结 60s，池内剩下的账号
+    /// 很快被同一条 1041 逐个带走（实测 4 个健康账号在 12 秒内全被打冷），
+    /// 换号这条路被自己堵死，客户端连续重试全部 429。
+    #[test]
+    fn concurrency_full_uses_short_yield_not_minute_window() {
+        // 让位窗口必须是秒级且远小于令牌桶窗口
+        assert!(
+            (1..=10).contains(&CONCURRENCY_FULL_COOLDOWN_SECS),
+            "并发满让位应为秒级：{CONCURRENCY_FULL_COOLDOWN_SECS}"
+        );
+        assert!(
+            CONCURRENCY_FULL_COOLDOWN_SECS < 60,
+            "绝不能复用令牌桶的 60s 窗口"
+        );
+
+        // 归因仍是 429 + SoftRate（不改既有契约，token_bucket_limit_* 依赖它），
+        // 但冷却时长由 note_failure 按 is_concurrency_full 分流，不走
+        // rate_limit_cooldown_secs
+        let conc = "TM.00001041 并发会话数已达上限(3个)，请关闭部分会话后重试。";
+        assert!(is_concurrency_full(conc));
+        assert_eq!(codearts_failure(200, conc), (429, ErrKind::SoftRate));
+
+        // 令牌桶文案的分钟级窗口不受影响（两条口径互不干扰）
+        let bucket = "the rate limit is 300000000 tokens per minute.";
+        assert!(is_rate_limited(bucket));
+        assert!(!is_concurrency_full(bucket));
+        assert!(rate_limit_cooldown_secs(bucket) != CONCURRENCY_FULL_COOLDOWN_SECS);
+    }
+
+    /// 81114（共享令牌桶）在**多账号**池上只做短窗软提示：一次撞桶不能推断
+    /// 「整个模型都满了」——其余账号的桶可能是空的。故它对模型表只落一个够
+    /// 换号重试的窗口，真正升级为全局模型冷却由「池耗尽」统一判定。
+    #[test]
+    fn rate_limit_is_soft_hint_until_pool_exhausted() {
+        // 软提示窗口：短到不冻结全池，长到够换号重试
+        assert!(
+            (1..=QUEUE_BACKOFF_MAX_SECS).contains(&RATE_LIMIT_SOFT_HINT_SECS),
+            "软提示窗口应在 1..={QUEUE_BACKOFF_MAX_SECS}s：{RATE_LIMIT_SOFT_HINT_SECS}"
+        );
+        assert!(
+            RATE_LIMIT_SOFT_HINT_SECS < QUEUE_BACKOFF_MAX_SECS,
+            "软提示必须显著短于池耗尽后的升级窗口"
+        );
+
+        let m = "__test_rate_soft_hint__";
+        clear_model_failure(m);
+
+        // 零命中：不升级（单次撞桶不足以判模型满）
+        escalate_rate_limit_if_exhausted(m, 0);
+        assert!(
+            model_cooling_remaining_secs(m).is_none(),
+            "无账号因限流失败时不得冻结模型"
+        );
+
+        // 有命中（池耗尽）：升级为满窗冷却，供 dispatch 预检快速回退
+        escalate_rate_limit_if_exhausted(m, 2);
+        let escalated = model_cooling_remaining_secs(m).expect("池耗尽应升级模型冷却");
+        assert!(
+            escalated + 1 >= RATE_LIMIT_SOFT_HINT_SECS,
+            "升级窗口应覆盖软提示：{escalated}"
+        );
+        clear_model_failure(m);
+    }
+
+    /// 池耗尽日志必须带上本轮真正试过的账号——否则日志里只有最后一条上游
+    /// 原文，看着像单个账号的上游错误，实际是「整池轮换耗尽」。
+    #[test]
+    fn tried_note_lists_attempted_accounts() {
+        assert_eq!(tried_note(&[]), "", "未试过账号时不产生噪音");
+        let note = tried_note(&["gt-185".into(), "csdn-185".into()]);
+        assert!(note.contains("tried_accounts=2/"), "{note}");
+        assert!(note.contains("gt-185") && note.contains("csdn-185"), "{note}");
+        // 空串不得让调用方拼出多余分隔符
+        let combined = format!("pool exhausted{}", tried_note(&[]));
+        assert_eq!(combined, "pool exhausted");
     }
 
     /// 会话头必须进签名集合：上游按 SignedHeaders 校验，头进请求但不进签名 → 401。

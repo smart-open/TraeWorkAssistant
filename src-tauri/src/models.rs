@@ -1013,11 +1013,13 @@ pub struct ApiPoolFile {
     /// CodeArts 慢请求竞速对冲阈值毫秒（0 = 关闭；预留）
     #[serde(default = "default_hedge_threshold_ms")]
     pub codearts_hedge_threshold_ms: u64,
-    /// CodeArts 会话粘性开关（默认关；预留）
-    #[serde(default)]
+    /// CodeArts 会话粘性开关（默认开）：同一对话绑定同一账号，保住上游
+    /// prompt cache。CodeArts 每轮都把完整历史重新 prefill（实测单账号 40 万
+    /// token/轮），多账号池下不粘性 = 每轮换号 = 缓存全 miss。
+    #[serde(default = "default_codearts_sticky_enabled")]
     pub codearts_sticky_enabled: bool,
-    /// CodeArts 池账号并发上限（默认 1；0 = 不限）
-    #[serde(default = "default_account_concurrency_limit")]
+    /// CodeArts 池账号并发上限（默认 3 = 上游每账号会话名额数；0 = 不限）
+    #[serde(default = "default_codearts_concurrency_limit")]
     pub codearts_account_concurrency_limit: u32,
     /// CodeArts 池粘性 TTL 秒（默认 300）
     #[serde(default = "default_pool_sticky_ttl_secs")]
@@ -1035,6 +1037,24 @@ fn default_hedge_threshold_ms() -> u64 {
 
 fn default_account_concurrency_limit() -> u32 {
     1
+}
+
+/// CodeArts 池账号并发上限默认值：**必须与上游会话名额一致（3）**。
+///
+/// 码道单账号硬性只给 3 个并发会话名额（见 `codearts_route` 的会话登记协议），
+/// 本地上限设得比它低是纯浪费（明明还有名额却不发请求），设得比它高则必然
+/// 换来 `TM.00001041`——而 1041 在成规模的池上会连带惩罚账号。故默认对齐 3。
+fn default_codearts_concurrency_limit() -> u32 {
+    3
+}
+
+/// CodeArts 会话粘性默认值：开。
+///
+/// 同一对话绑定同一账号才能吃到上游 prompt cache。CodeArts 每轮都把完整历史
+/// 重新 prefill（实测单账号约 40 万 token/轮），多账号池下不粘性 = 每轮换号
+/// = 缓存全 miss，既烧额度也把上游令牌桶推高。
+fn default_codearts_sticky_enabled() -> bool {
+    true
 }
 
 fn default_pool_sticky_ttl_secs() -> u64 {
@@ -1115,8 +1135,8 @@ impl Default for ApiPoolFile {
             codearts_group_ids: Vec::new(),
             codearts_tag_ids: Vec::new(),
             codearts_hedge_threshold_ms: default_hedge_threshold_ms(),
-            codearts_sticky_enabled: false,
-            codearts_account_concurrency_limit: default_account_concurrency_limit(),
+            codearts_sticky_enabled: default_codearts_sticky_enabled(),
+            codearts_account_concurrency_limit: default_codearts_concurrency_limit(),
             codearts_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             codearts_sticky_ttl_secs: default_sticky_ttl_secs(),
         }

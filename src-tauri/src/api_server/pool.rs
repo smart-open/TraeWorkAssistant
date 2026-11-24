@@ -1035,12 +1035,14 @@ impl ApiPool {
             let entries = safe_lock(&self.entries);
             let now = now_ts();
             let tried = HashSet::new();
+            // has_other：fold 只遍历已通过 selectable/allowed 过滤的条目，
+            // 能进到闭包即说明存在其他健康候选
             entries
                 .values()
                 .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve, skip_credit_filters))
-                .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
-                .fold((false, false), |(any, idle), e| {
-                    (any || true, idle || inflight_of(e, &inflight) < limit)
+                .filter(|e| allowed.is_none_or(|a| a.contains(&e.uid)))
+                .fold((false, false), |(_any, idle), e| {
+                    (true, idle || inflight_of(e, &inflight) < limit)
                 })
         };
         if !has_other {
