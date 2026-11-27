@@ -496,15 +496,22 @@ pub fn resolve_target(
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
-    let r = wb_model_route::resolve(&cfg, &catalog, model);
-    // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
-    // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
-    let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
     // buddy-ai 国际档开关（阶段 2）：显式开启制，默认关（前移读取：Intl 专属
-    // id 折入与双收录判定均以本开关为前提）
+    // id 折入与双收录判定均以本开关为前提；Intl 直连判定（⓪）同样要先于 resolve）
     let buddy_ai_enabled = state
         .buddy_ai_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
+    // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
+    // 先于 resolve 加载：Intl 直连判定（⓪）需要它——否则 gpt-*/gemini-* 真实模型
+    // 会被内置系列通配改写成 CN 目录模型（详见 resolve_with_intl 注释）
+    let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
+    let r = wb_model_route::resolve_with_intl(
+        &cfg,
+        &catalog,
+        if buddy_ai_enabled { Some(&intl_catalog) } else { None },
+        model,
+    );
     // 审查修复（buddy-ai Intl 专属模型误路由）：CN 目录未命中时并查 Intl 目录
     //（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等 Intl 专属 id
     // 不在 CN 目录，原实现 buddy_hit=None → 落 Trae 透传语义被误路由 Trae 上游。
