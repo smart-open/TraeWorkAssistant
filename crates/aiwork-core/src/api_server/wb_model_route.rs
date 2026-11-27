@@ -132,6 +132,26 @@ pub fn wildcard_match(pattern: &str, name: &str) -> bool {
 
 /// 四段路由解析（每级命中即止；目标不在目录视为该级未命中）
 pub fn resolve(cfg: &WbRouteFile, catalog: &[super::wb_catalog::WbModel], requested: &str) -> RouteResult {
+    resolve_with_intl(cfg, catalog, None, requested)
+}
+
+/// 四段路由解析（含 Intl 目录直连判定）。
+///
+/// `intl` 非空（buddy-ai 国际档开启）时在 ①② 之后、③ 之前插入 **⓪ 直连命中**：
+/// 请求名本身已在 CN 或 Intl 目录中 → 原样透传，不参与 ③ 系列通配与 ④ 后缀改写。
+/// 用户的 ①别名 / ②自定义规则优先级仍高于本层（可显式覆盖）。
+///
+/// 修复背景（2026-11-27）：`gpt-*` 内置系列通配目标 `deepseek-v4-pro` 在 CN
+/// 目录存在，故 Intl 真实模型 `gpt-6.2-sol` 被改写成 `deepseek-v4-pro` 发往
+/// buddy-ai 池，上游 400/11102 service info not found；`gemini-3.8-flash` 则被
+/// 静默换成 `glm-5.3`（响应 model 与请求不一致，用户无从察觉）。
+/// `intl` 为 None 时保持原四段语义，CN-only 部署零行为变化。
+pub fn resolve_with_intl(
+    cfg: &WbRouteFile,
+    catalog: &[super::wb_catalog::WbModel],
+    intl: Option<&[super::wb_catalog::WbModel]>,
+    requested: &str,
+) -> RouteResult {
     let req = requested.trim().to_string();
     if req.is_empty() {
         return RouteResult::direct(req);
@@ -154,6 +174,17 @@ pub fn resolve(cfg: &WbRouteFile, catalog: &[super::wb_catalog::WbModel], reques
                 return RouteResult { model: target, effort_hint: None, stage: "rule" };
             }
         }
+    }
+
+    // ⓪ 直连命中（别名/用户规则之后、内置系列通配之前）：请求名本身已在 CN 或
+    // Intl 目录中 → 原样透传。用户的 ①别名 ②规则 优先级仍高于本层，可显式覆盖。
+    // 修复（2026-11-27）：`gpt-*`/`gemini-*` 等 Intl 真实模型原会被 ③ 系列通配
+    // 改写成 CN 目标（gpt-6.2-sol→deepseek-v4-pro 上游 11102；gemini-3.8-flash
+    // →glm-5.3 静默换模型）
+    if let Some(id) = catalog_hit(catalog, &req)
+        .or_else(|| intl.and_then(|c| catalog_hit(c, &req)))
+    {
+        return RouteResult { model: id, effort_hint: None, stage: "direct" };
     }
 
     // ③ 内置系列通配
@@ -425,6 +456,65 @@ mod tests {
         assert_eq!(r.model, "deepseek-v4-pro");
         let r = resolve(&empty_cfg(), &catalog(), "o3-mini");
         assert_eq!(r.model, "hy4");
+    }
+
+    // ---------- resolve_with_intl：Intl 目录直连（⓪） ----------
+
+    /// Intl 真实模型原样透传：不得被内置系列通配改写成 CN 目录模型。
+    /// 修复前 `gpt-*` → `deepseek-v4-pro`（Intl 池无此模型，上游 11102）、
+    /// `gemini-*` → `glm-5.3`（静默换模型，响应 model 与请求不一致）
+    #[test]
+    fn intl_real_model_passes_through_when_intl_catalog_present() {
+        let intl = wb_catalog::builtin_buddy_ai();
+        let r = resolve_with_intl(&empty_cfg(), &catalog(), Some(&intl), "gpt-6-astra");
+        assert_eq!(r.stage, "direct");
+        assert_eq!(r.model, "gpt-6-astra");
+        assert!(r.effort_hint.is_none());
+
+        let r = resolve_with_intl(&empty_cfg(), &catalog(), Some(&intl), "gemini-3.5-flash");
+        assert_eq!(r.stage, "direct");
+        assert_eq!(r.model, "gemini-3.5-flash");
+    }
+
+    /// `intl` 为 None（国际档关闭 / CN-only 部署）→ 保持原四段语义，零行为变化
+    #[test]
+    fn intl_none_keeps_builtin_series_rewrite() {
+        let r = resolve_with_intl(&empty_cfg(), &catalog(), None, "gpt-6-astra");
+        assert_eq!(r.stage, "series");
+        assert_eq!(r.model, "deepseek-v4-pro");
+    }
+
+    /// ① 别名 / ② 用户规则的优先级仍高于 ⓪ 直连（可显式覆盖 Intl 真实模型）
+    #[test]
+    fn alias_and_rule_still_override_intl_direct() {
+        let intl = wb_catalog::builtin_buddy_ai();
+
+        let mut cfg = empty_cfg();
+        cfg.aliases.insert("gpt-6-astra".into(), "GLM-5.3".into());
+        let r = resolve_with_intl(&cfg, &catalog(), Some(&intl), "gpt-6-astra");
+        assert_eq!(r.stage, "alias");
+        assert_eq!(r.model, "glm-5.3");
+
+        let mut cfg2 = empty_cfg();
+        cfg2.rules.push(RouteRule { pattern: "gemini-*".into(), target: "kimi-k3-1".into() });
+        let r2 = resolve_with_intl(&cfg2, &catalog(), Some(&intl), "gemini-3.5-flash");
+        assert_eq!(r2.stage, "rule");
+        assert_eq!(r2.model, "kimi-k3-1");
+    }
+
+    /// ⓪ 只拦"目录里真有的名字"，目录外名字仍走 ③ 系列通配 / ④ 后缀
+    #[test]
+    fn intl_direct_does_not_swallow_series_or_suffix() {
+        let intl = wb_catalog::builtin_buddy_ai();
+        // 目录外 → 系列通配（客户端硬编码的老名字仍要靠它兜底）
+        let r = resolve_with_intl(&empty_cfg(), &catalog(), Some(&intl), "gpt-4o");
+        assert_eq!(r.stage, "series");
+        assert_eq!(r.model, "deepseek-v4-pro");
+        // 目录外 + 后缀 → 后缀剥离命中 CN 目录
+        let r = resolve_with_intl(&empty_cfg(), &catalog(), Some(&intl), "glm-5.3-thinking");
+        assert_eq!(r.stage, "suffix");
+        assert_eq!(r.model, "glm-5.3");
+        assert_eq!(r.effort_hint.as_deref(), Some("high"));
     }
 
     #[test]

@@ -528,10 +528,17 @@ pub fn resolve_target(
     // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
-    let r = wb_model_route::resolve(&cfg, &catalog, model);
     // Intl 目录动态化（2026-10-15）：动态抓取结果优先（kv buddy_ai_model_catalog），
     // 缺失回落内置静态表——/v3/config 实抓成功后倍率/上下文即随动态目录生效
+    // 先于 resolve 加载：Intl 直连判定（⓪）需要它——否则 gpt-*/gemini-* 真实模型
+    // 会被内置系列通配改写成 CN 目录模型（详见 resolve_with_intl 注释）
     let intl_catalog = super::wb_catalog::buddy_ai_load(&state.data_dir);
+    let r = wb_model_route::resolve_with_intl(
+        &cfg,
+        &catalog,
+        if buddy_ai_enabled { Some(&intl_catalog) } else { None },
+        model,
+    );
     // Intl 目录并查（§4.4 Global 专属模型可路由）——deepseek-v4.1-flash / gpt-* 等
     // Intl 专属 id 不在 CN 目录，命中折入 buddy 源（final_model/effort/冷却链路复用），
     // buddy_intl_only 标记随源携带：Buddy(CN) 池不得服务 Intl 专属模型（available 门控）。
